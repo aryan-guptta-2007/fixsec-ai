@@ -1,0 +1,12 @@
+# FixSec AI Workspace Directory
+# This directory contains temporary repository clones for scanning and PR operations
+# Contents should not be committed to version control
+
+# Ignore all workspace contents
+*
+
+# But keep this .gitignore file
+!.gitignore
+
+# Keep README for documentation
+!README.md

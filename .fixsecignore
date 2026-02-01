@@ -1,0 +1,35 @@
+# FixSec AI Ignore Rules
+# Production configuration - no demo vulnerabilities
+
+# Ignore build and dependency directories
+node_modules/
+dist/
+build/
+.next/
+*.min.js
+
+# Ignore test files (they often contain fake secrets for testing)
+test/**/*
+tests/**/*
+__tests__/**/*
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+
+# Ignore demo and example files
+demo/**/*
+examples/**/*
+**/demo/**/*
+**/examples/**/*
+
+# Ignore specific demo patterns
+*demo*
+*example*
+*test*api*key*
+*fake*secret*
+
+# Ignore documentation that might contain example keys
+README.md
+docs/**/*
+*.md

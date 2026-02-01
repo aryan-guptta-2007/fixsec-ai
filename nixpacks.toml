@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python39", "nodejs", "git"]
+
+[phases.install]
+cmds = ["cd backend && pip install -r requirements-prod.txt"]
+
+[phases.build]
+cmds = ["cd backend && python -m compileall ."]
+
+[start]
+cmd = "cd backend && python db/init_db.py && uvicorn main:app --host 0.0.0.0 --port $PORT"

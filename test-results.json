@@ -1,0 +1,97 @@
+{
+  "total": 15,
+  "passed": 4,
+  "failed": 11,
+  "tests": [
+    {
+      "name": "API Health Check",
+      "passed": false,
+      "message": "API not accessible: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.259Z"
+    },
+    {
+      "name": "Frontend Health Check",
+      "passed": false,
+      "message": "Frontend not accessible: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.271Z"
+    },
+    {
+      "name": "Authentication Endpoints",
+      "passed": false,
+      "message": "Auth endpoints error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.273Z"
+    },
+    {
+      "name": "Scan Endpoint Structure",
+      "passed": false,
+      "message": "Scan endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.279Z"
+    },
+    {
+      "name": "Vulnerability Detection Logic",
+      "passed": true,
+      "message": "All 3 test secrets detected correctly",
+      "timestamp": "2026-02-01T14:44:30.279Z"
+    },
+    {
+      "name": "Security Score Calculation",
+      "passed": true,
+      "message": "Security score calculated correctly: 70",
+      "timestamp": "2026-02-01T14:44:30.279Z"
+    },
+    {
+      "name": "Fix Plan Generation",
+      "passed": false,
+      "message": "Fix plan endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.283Z"
+    },
+    {
+      "name": "PR Creation Endpoint",
+      "passed": false,
+      "message": "PR creation endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.289Z"
+    },
+    {
+      "name": "Schedule Endpoints",
+      "passed": false,
+      "message": "Schedule endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.292Z"
+    },
+    {
+      "name": "Notification System",
+      "passed": true,
+      "message": "Notification configuration validation working",
+      "timestamp": "2026-02-01T14:44:30.293Z"
+    },
+    {
+      "name": "Billing Endpoints",
+      "passed": false,
+      "message": "Billing endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.295Z"
+    },
+    {
+      "name": "Plan Limits Logic",
+      "passed": true,
+      "message": "Plan limits configured correctly",
+      "timestamp": "2026-02-01T14:44:30.295Z"
+    },
+    {
+      "name": "Subscription Flow Structure",
+      "passed": false,
+      "message": "Subscription endpoint error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.298Z"
+    },
+    {
+      "name": "Error Response Handling",
+      "passed": false,
+      "message": "Error handling test failed: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.303Z"
+    },
+    {
+      "name": "Input Validation",
+      "passed": false,
+      "message": "Input validation test error: fetch failed",
+      "timestamp": "2026-02-01T14:44:30.306Z"
+    }
+  ]
+}

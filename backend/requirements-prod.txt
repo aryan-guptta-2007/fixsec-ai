@@ -1,0 +1,19 @@
+# Production requirements for FixSec AI
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+requests==2.31.0
+gitpython==3.1.40
+pydantic==2.5.0
+python-multipart==0.0.6
+alembic==1.13.0
+stripe==7.8.0
+
+# Production-specific packages
+gunicorn==21.2.0
+asyncpg==0.29.0
+redis==5.0.1
+celery==5.3.4
+sentry-sdk[fastapi]==1.38.0
