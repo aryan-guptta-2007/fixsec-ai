@@ -1,46 +1,100 @@
 """
-In-memory scan history store
-Later this will be replaced with a proper database
+Stored scan queries. Every function is scoped to one user: nobody can read
+findings for a repository they did not scan themselves.
 """
-from datetime import datetime
-from typing import List, Dict, Any
 import json
+from typing import Any, Dict, List, Optional
 
-# In-memory storage (will be replaced with DB later)
-scan_history_store: Dict[str, List[Dict[str, Any]]] = {}
+from sqlalchemy.orm import Session
 
-def save_scan_result(repo: str, scan_data: Dict[str, Any]) -> None:
-    """Save scan result to history"""
-    if repo not in scan_history_store:
-        scan_history_store[repo] = []
-    
-    # Add timestamp and scan ID
-    scan_record = {
-        "scan_id": f"scan_{len(scan_history_store[repo]) + 1}",
-        "timestamp": datetime.utcnow().isoformat(),
-        "repo": repo,
-        "vulnerabilities": scan_data.get("vulnerabilities", []),
-        "count": scan_data.get("count", 0),
-        "status": scan_data.get("status", ""),
-        "branch_scanned": scan_data.get("branch_scanned", "main")
+from core.security_scorer import calculate_trend_analysis
+from db.models import Repository, Scan, User
+
+
+def _record(scan: Scan, repo_name: str) -> Dict[str, Any]:
+    return {
+        "scan_id": scan.id,
+        "timestamp": scan.started_at.isoformat(),
+        "repo": repo_name,
+        "count": scan.issues_found or 0,
+        "status": scan.status,
+        "branch_scanned": scan.branch,
+        "score": scan.security_score,
+        "grade": scan.grade,
+        "trigger": scan.trigger,
     }
-    
-    # Keep only last 10 scans per repo (memory management)
-    scan_history_store[repo].append(scan_record)
-    if len(scan_history_store[repo]) > 10:
-        scan_history_store[repo] = scan_history_store[repo][-10:]
-    
-    print(f"📊 Saved scan history for {repo}: {scan_record['count']} issues")
 
-def get_scan_history(repo: str) -> List[Dict[str, Any]]:
-    """Get scan history for a repository"""
-    return scan_history_store.get(repo, [])
 
-def get_all_repos_with_history() -> List[str]:
-    """Get list of all repos that have scan history"""
-    return list(scan_history_store.keys())
+def get_scan_result(db: Session, user: User, scan_id: int) -> Optional[Dict[str, Any]]:
+    scan = (
+        db.query(Scan)
+        .join(Repository)
+        .filter(Scan.id == scan_id, Repository.user_id == user.id, Scan.status == "completed")
+        .first()
+    )
+    return json.loads(scan.result_json) if scan and scan.result_json else None
 
-def get_latest_scan(repo: str) -> Dict[str, Any] | None:
-    """Get the most recent scan for a repository"""
-    history = get_scan_history(repo)
-    return history[-1] if history else None
+
+def get_scan_history(db: Session, user: User, repo: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Scans for one repository, oldest first."""
+    scans = (
+        db.query(Scan)
+        .join(Repository)
+        .filter(Repository.user_id == user.id, Repository.repo_name == repo)
+        .order_by(Scan.started_at.desc(), Scan.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [_record(scan, repo) for scan in reversed(scans)]
+
+
+def get_latest_scan_id(db: Session, user: User, repo: str) -> Optional[int]:
+    scan = (
+        db.query(Scan)
+        .join(Repository)
+        .filter(
+            Repository.user_id == user.id,
+            Repository.repo_name == repo,
+            Scan.status == "completed",
+        )
+        .order_by(Scan.started_at.desc(), Scan.id.desc())
+        .first()
+    )
+    return scan.id if scan else None
+
+
+def get_security_score(db: Session, user: User, repo: str) -> Optional[Dict[str, Any]]:
+    history = [scan for scan in get_scan_history(db, user, repo) if scan["status"] == "completed"]
+    if not history:
+        return None
+    latest = history[-1]
+    result = get_scan_result(db, user, latest["scan_id"]) or {}
+    return {
+        "repo": repo,
+        "current_score": result.get("security_score"),
+        "trend_analysis": calculate_trend_analysis(history),
+        "last_scan": latest["timestamp"],
+        "total_scans": len(history),
+    }
+
+
+def get_overview(db: Session, user: User) -> List[Dict[str, Any]]:
+    """Every scanned repository with recent history and its current score."""
+    repositories = (
+        db.query(Repository)
+        .filter(Repository.user_id == user.id)
+        .order_by(Repository.repo_name)
+        .all()
+    )
+    overview = []
+    for repository in repositories:
+        history = get_scan_history(db, user, repository.repo_name, limit=10)
+        if history:
+            overview.append(
+                {
+                    "repo": repository.repo_name,
+                    "history": history,
+                    "score": get_security_score(db, user, repository.repo_name),
+                }
+            )
+    return overview

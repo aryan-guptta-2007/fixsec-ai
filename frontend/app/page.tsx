@@ -3,6 +3,30 @@
 import Link from 'next/link'
 import { ShieldCheckIcon, CodeBracketIcon, BoltIcon } from '@heroicons/react/24/outline'
 
+const PRICING = [
+  {
+    name: 'Free',
+    price: 0,
+    features: ['1 repository', '1 scan per day', 'Detection and fix plans'],
+  },
+  {
+    name: 'Starter',
+    price: 25,
+    features: ['5 repositories', 'Unlimited scans', 'Detection and fix plans'],
+  },
+  {
+    name: 'Professional',
+    price: 49,
+    popular: true,
+    features: ['Unlimited repositories', 'Unlimited scans', 'Auto-fix PRs'],
+  },
+  {
+    name: 'Team',
+    price: 99,
+    features: ['Everything in Professional', 'Scheduled scans', 'Slack, Discord and webhook alerts'],
+  },
+]
+
 export default function HomePage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
@@ -29,7 +53,7 @@ export default function HomePage() {
           </h1>
           <p className="text-xl text-gray-600 mb-8 max-w-3xl mx-auto">
             FixSec AI automatically scans your GitHub repositories for security vulnerabilities 
-            and creates pull requests with working fixes. Focus on building, we'll handle security.
+            and creates pull requests with working fixes. Focus on building, we&apos;ll handle security.
           </p>
           <div className="flex justify-center space-x-4">
             <Link href="/login" className="btn-primary text-lg px-8 py-3">
@@ -74,7 +98,7 @@ export default function HomePage() {
         {/* Vulnerability Types */}
         <div className="mt-24">
           <h2 className="text-3xl font-bold text-center text-gray-900 mb-12">
-            What We Detect & Fix
+            What We Detect
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="bg-red-50 border border-red-200 rounded-lg p-6">
@@ -93,7 +117,7 @@ export default function HomePage() {
                 <li>• String concatenation</li>
                 <li>• Template literals</li>
                 <li>• Direct user input</li>
-                <li>• Unsafe queries</li>
+                <li>• Suggested safe rewrites</li>
               </ul>
             </div>
             
@@ -101,10 +125,8 @@ export default function HomePage() {
               <h3 className="text-lg font-semibold text-yellow-800 mb-2">📦 Dependencies</h3>
               <ul className="text-yellow-700 space-y-1">
                 <li>• Vulnerable packages</li>
-                <li>• Outdated libraries</li>
-                <li>• Security patches</li>
-                <li>• Version updates</li>
-              </ul>
+                                <li>• Security patches</li>
+                              </ul>
             </div>
           </div>
         </div>
@@ -114,51 +136,34 @@ export default function HomePage() {
           <h2 className="text-3xl font-bold text-center text-gray-900 mb-12">
             Simple, Transparent Pricing
           </h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto">
-            <div className="card text-center">
-              <h3 className="text-xl font-semibold mb-2">Free</h3>
-              <div className="text-3xl font-bold text-gray-900 mb-4">$0</div>
-              <ul className="text-gray-600 space-y-2 mb-6">
-                <li>• 1 repository</li>
-                <li>• 1 scan per day</li>
-                <li>• Detection only</li>
-                <li>• Basic support</li>
-              </ul>
-              <Link href="/login" className="btn-secondary w-full">
-                Get Started
-              </Link>
-            </div>
-            
-            <div className="card text-center border-2 border-blue-500 relative">
-              <div className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-blue-500 text-white px-4 py-1 rounded-full text-sm">
-                Most Popular
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
+            {PRICING.map((plan) => (
+              <div
+                key={plan.name}
+                className={`card text-center relative flex flex-col ${
+                  plan.popular ? "border-2 border-blue-500" : ""
+                }`}
+              >
+                {plan.popular && (
+                  <div className="absolute -top-3 left-1/2 transform -translate-x-1/2 bg-blue-500 text-white px-4 py-1 rounded-full text-sm whitespace-nowrap">
+                    Most Popular
+                  </div>
+                )}
+                <h3 className="text-xl font-semibold mb-2">{plan.name}</h3>
+                <div className="text-3xl font-bold text-gray-900 mb-4">
+                  ${plan.price}
+                  {plan.price > 0 && <span className="text-lg text-gray-600">/mo</span>}
+                </div>
+                <ul className="text-gray-600 space-y-2 mb-6 flex-1">
+                  {plan.features.map((feature) => (
+                    <li key={feature}>• {feature}</li>
+                  ))}
+                </ul>
+                <Link href="/login" className={`${plan.popular ? "btn-primary" : "btn-secondary"} w-full`}>
+                  Get Started
+                </Link>
               </div>
-              <h3 className="text-xl font-semibold mb-2">Pro</h3>
-              <div className="text-3xl font-bold text-gray-900 mb-4">$49<span className="text-lg text-gray-600">/mo</span></div>
-              <ul className="text-gray-600 space-y-2 mb-6">
-                <li>• 5 repositories</li>
-                <li>• Unlimited scans</li>
-                <li>• Auto-fix PRs</li>
-                <li>• Priority support</li>
-              </ul>
-              <Link href="/login" className="btn-primary w-full">
-                Start Free Trial
-              </Link>
-            </div>
-            
-            <div className="card text-center">
-              <h3 className="text-xl font-semibold mb-2">Team</h3>
-              <div className="text-3xl font-bold text-gray-900 mb-4">$199<span className="text-lg text-gray-600">/mo</span></div>
-              <ul className="text-gray-600 space-y-2 mb-6">
-                <li>• 20 repositories</li>
-                <li>• Scheduled scans</li>
-                <li>• Slack alerts</li>
-                <li>• Team management</li>
-              </ul>
-              <Link href="/login" className="btn-secondary w-full">
-                Contact Sales
-              </Link>
-            </div>
+            ))}
           </div>
         </div>
       </main>

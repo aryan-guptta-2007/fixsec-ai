@@ -129,6 +129,8 @@ Thumbs.db
 *.lnk
 
 # Workspace files
+workspace/
+*/workspace/
 backend/workspace/repos/
 backend/workspace/temp/
 backend/workspace/*

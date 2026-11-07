@@ -8,13 +8,20 @@ interface EnhancedSecurityScoreProps {
 export default function EnhancedSecurityScore({ enhancedScoring, className = '' }: EnhancedSecurityScoreProps) {
   if (!enhancedScoring) return null
 
-  const { score, grade, impact_breakdown, recommendations, next_best_fixes, time_to_a_plus, risk_level } = enhancedScoring
+  const score = typeof enhancedScoring.score === 'number' ? enhancedScoring.score : 0
+  const grade = typeof enhancedScoring.grade === 'string' ? enhancedScoring.grade : 'N/A'
+  const impact_breakdown = enhancedScoring.impact_breakdown || {}
+  const recommendations = enhancedScoring.recommendations || []
+  const next_best_fixes = enhancedScoring.next_best_fixes || []
+  const time_to_a_plus = enhancedScoring.time_to_a_plus || 'N/A'
+  const risk_level = enhancedScoring.risk_level || 'UNKNOWN'
 
-  const getGradeColor = (grade: string) => {
-    if (grade.startsWith('A')) return 'text-green-600 bg-green-100'
-    if (grade.startsWith('B')) return 'text-blue-600 bg-blue-100'
-    if (grade.startsWith('C')) return 'text-yellow-600 bg-yellow-100'
-    if (grade.startsWith('D')) return 'text-orange-600 bg-orange-100'
+  const getGradeColor = (g: string) => {
+    if (!g) return 'text-gray-600 bg-gray-100'
+    if (g.startsWith('A')) return 'text-green-600 bg-green-100'
+    if (g.startsWith('B')) return 'text-blue-600 bg-blue-100'
+    if (g.startsWith('C')) return 'text-yellow-600 bg-yellow-100'
+    if (g.startsWith('D')) return 'text-orange-600 bg-orange-100'
     return 'text-red-600 bg-red-100'
   }
 
@@ -28,11 +35,11 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
     }
   }
 
-  const getScoreColor = (score: number) => {
-    if (score >= 90) return 'text-green-600'
-    if (score >= 75) return 'text-blue-600'
-    if (score >= 60) return 'text-yellow-600'
-    if (score >= 40) return 'text-orange-600'
+  const getScoreColor = (s: number) => {
+    if (s >= 90) return 'text-green-600'
+    if (s >= 75) return 'text-blue-600'
+    if (s >= 60) return 'text-yellow-600'
+    if (s >= 40) return 'text-orange-600'
     return 'text-red-600'
   }
 
@@ -41,11 +48,8 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <h3 className="text-lg font-semibold text-gray-900">
-          🛡️ Smart Security Analysis
+          🛡️ Security Analysis
         </h3>
-        <div className="text-sm text-gray-500">
-          Powered by FixSec AI
-        </div>
       </div>
 
       {/* Score Display */}
@@ -85,7 +89,7 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
         </h4>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {Object.entries(impact_breakdown).map(([category, data]: [string, any]) => {
-            if (data.count === 0) return null
+            if (!data || data.count === 0) return null
             
             const categoryIcons = {
               secrets: '🔑',
@@ -103,18 +107,20 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
               other: 'Other'
             }
 
+            const deductionVal = typeof data.deduction === 'number' ? data.deduction.toFixed(1) : (data.deduction || 0)
+
             return (
               <div key={category} className="bg-gray-50 rounded-lg p-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-sm font-medium text-gray-700">
-                    {categoryIcons[category as keyof typeof categoryIcons]} {categoryNames[category as keyof typeof categoryNames]}
+                    {categoryIcons[category as keyof typeof categoryIcons] || '🔍'} {categoryNames[category as keyof typeof categoryNames] || category}
                   </span>
                   <span className="text-sm font-bold text-red-600">
-                    -{data.deduction.toFixed(1)}
+                    -{deductionVal}
                   </span>
                 </div>
                 <div className="text-xs text-gray-500">
-                  {data.count} issue{data.count !== 1 ? 's' : ''} • {data.impact} impact
+                  {data.count} issue{data.count !== 1 ? 's' : ''} • {data.impact || 'low'} impact
                 </div>
               </div>
             )
@@ -126,7 +132,7 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
       {next_best_fixes && next_best_fixes.length > 0 && (
         <div className="mb-6">
           <h4 className="text-md font-semibold text-gray-900 mb-3">
-            🎯 Next Best Fixes (Gamification)
+            🎯 Next Best Fixes
           </h4>
           <div className="space-y-3">
             {next_best_fixes.slice(0, 3).map((fix: any, index: number) => (
@@ -162,7 +168,7 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
       {recommendations && recommendations.length > 0 && (
         <div>
           <h4 className="text-md font-semibold text-gray-900 mb-3">
-            💡 Smart Recommendations
+            💡 Recommendations
           </h4>
           <div className="space-y-2">
             {recommendations.slice(0, 3).map((rec: string, index: number) => (
@@ -171,21 +177,13 @@ export default function EnhancedSecurityScore({ enhancedScoring, className = '' 
                   {rec.startsWith('🚨') ? '🚨' : rec.startsWith('⚠️') ? '⚠️' : '💡'}
                 </div>
                 <div className="text-sm text-gray-700 flex-1">
-                  {rec.replace(/^[🚨⚠️💡]\s*/, '')}
+                  {rec.replace(/^(🚨|⚠️|💡|📈|🔥|✅)\s*/u, '')}
                 </div>
               </div>
             ))}
           </div>
         </div>
       )}
-
-      {/* Competitive Advantage Footer */}
-      <div className="mt-6 pt-4 border-t border-gray-200">
-        <div className="flex items-center justify-between text-xs text-gray-500">
-          <span>🚀 Smart scoring that actually matters</span>
-          <span>10x better than enterprise tools</span>
-        </div>
-      </div>
     </div>
   )
 }

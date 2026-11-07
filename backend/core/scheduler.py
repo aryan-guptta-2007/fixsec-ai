@@ -1,16 +1,36 @@
 """
-Scheduled Scan System - Enterprise-grade automated security scanning
-This is what premium cybersecurity SaaS platforms charge $500-1000/month for
+Scheduled scans: stored in the database and run by a background thread.
+
+Several server workers can run this loop at once. A due schedule is claimed with
+a conditional UPDATE, so only one worker gets each run.
 """
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
 import json
+import logging
+import threading
+from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
+from config import settings
+from core.billing import get_billing_manager
+from core.notifications import send_notifications
+from core.scan_engine import run_scan
+from core.security import redact
+from core.workspace import get_workspace_manager
+from db.models import ScheduledScan, User
+from db.session import SessionLocal
+
+logger = logging.getLogger(__name__)
+
 
 class ScanFrequency(str, Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+
 
 class NotificationChannel(str, Enum):
     EMAIL = "email"
@@ -18,172 +38,167 @@ class NotificationChannel(str, Enum):
     SLACK = "slack"
     WEBHOOK = "webhook"
 
-# In-memory storage for scheduled scans (will be replaced with DB later)
-scheduled_scans_store: Dict[str, Dict[str, Any]] = {}
+
+INTERVALS = {
+    ScanFrequency.DAILY.value: timedelta(days=1),
+    ScanFrequency.WEEKLY.value: timedelta(weeks=1),
+    ScanFrequency.MONTHLY.value: timedelta(days=30),
+}
+
+
+def next_run_after(moment: datetime, frequency: str) -> datetime:
+    return moment + INTERVALS[frequency]
+
+
+def serialize_schedule(schedule: ScheduledScan) -> Dict[str, Any]:
+    return {
+        "id": schedule.id,
+        "schedule_id": schedule.id,
+        "repo": schedule.repo_name,
+        "frequency": schedule.frequency,
+        "notification_channels": json.loads(schedule.notification_channels or "[]"),
+        "enabled": schedule.enabled,
+        "status": "ACTIVE" if schedule.enabled else "PAUSED",
+        "next_run": schedule.next_run.isoformat(),
+        "last_run": schedule.last_run.isoformat() if schedule.last_run else None,
+        "run_count": schedule.run_count or 0,
+        "last_result": json.loads(schedule.last_result) if schedule.last_result else None,
+        "created_at": schedule.created_at.isoformat(),
+    }
+
 
 def create_scheduled_scan(
-    user_token: str,
+    db: Session,
+    user: User,
     repo: str,
     frequency: ScanFrequency,
     notification_channels: List[Dict[str, Any]],
-    enabled: bool = True
-) -> Dict[str, Any]:
-    """Create a new scheduled scan"""
-    
-    schedule_id = f"schedule_{len(scheduled_scans_store) + 1}"
-    
-    # Calculate next run time
-    now = datetime.utcnow()
-    if frequency == ScanFrequency.DAILY:
-        next_run = now + timedelta(days=1)
-    elif frequency == ScanFrequency.WEEKLY:
-        next_run = now + timedelta(weeks=1)
-    else:  # MONTHLY
-        next_run = now + timedelta(days=30)
-    
-    schedule_data = {
-        "schedule_id": schedule_id,
-        "user_token": user_token,
-        "repo": repo,
-        "frequency": frequency,
-        "notification_channels": notification_channels,
-        "enabled": enabled,
-        "created_at": now.isoformat(),
-        "next_run": next_run.isoformat(),
-        "last_run": None,
-        "run_count": 0,
-        "status": "ACTIVE" if enabled else "PAUSED"
-    }
-    
-    scheduled_scans_store[schedule_id] = schedule_data
-    
-    print(f"📅 Created scheduled scan: {repo} - {frequency} - {len(notification_channels)} channels")
-    
-    return schedule_data
+    enabled: bool = True,
+) -> ScheduledScan:
+    schedule = ScheduledScan(
+        user_id=user.id,
+        repo_name=repo,
+        frequency=frequency.value,
+        notification_channels=json.dumps(notification_channels),
+        enabled=enabled,
+        next_run=next_run_after(datetime.utcnow(), frequency.value),
+        run_count=0,
+    )
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
+    return schedule
 
-def get_user_scheduled_scans(user_token: str) -> List[Dict[str, Any]]:
-    """Get all scheduled scans for a user"""
-    user_scans = []
-    for schedule_id, scan_data in scheduled_scans_store.items():
-        if scan_data["user_token"] == user_token:
-            user_scans.append(scan_data)
-    
-    return sorted(user_scans, key=lambda x: x["created_at"], reverse=True)
 
-def get_scheduled_scan(schedule_id: str) -> Optional[Dict[str, Any]]:
-    """Get a specific scheduled scan"""
-    return scheduled_scans_store.get(schedule_id)
+def get_user_scheduled_scans(db: Session, user: User) -> List[ScheduledScan]:
+    return (
+        db.query(ScheduledScan)
+        .filter(ScheduledScan.user_id == user.id)
+        .order_by(ScheduledScan.created_at.desc())
+        .all()
+    )
 
-def update_scheduled_scan(
-    schedule_id: str,
-    frequency: Optional[ScanFrequency] = None,
-    notification_channels: Optional[List[Dict[str, Any]]] = None,
-    enabled: Optional[bool] = None
-) -> Dict[str, Any]:
-    """Update an existing scheduled scan"""
-    
-    if schedule_id not in scheduled_scans_store:
-        raise ValueError(f"Scheduled scan {schedule_id} not found")
-    
-    scan_data = scheduled_scans_store[schedule_id]
-    
-    if frequency is not None:
-        scan_data["frequency"] = frequency
-        # Recalculate next run time
-        now = datetime.utcnow()
-        if frequency == ScanFrequency.DAILY:
-            scan_data["next_run"] = (now + timedelta(days=1)).isoformat()
-        elif frequency == ScanFrequency.WEEKLY:
-            scan_data["next_run"] = (now + timedelta(weeks=1)).isoformat()
-        else:  # MONTHLY
-            scan_data["next_run"] = (now + timedelta(days=30)).isoformat()
-    
-    if notification_channels is not None:
-        scan_data["notification_channels"] = notification_channels
-    
-    if enabled is not None:
-        scan_data["enabled"] = enabled
-        scan_data["status"] = "ACTIVE" if enabled else "PAUSED"
-    
-    scan_data["updated_at"] = datetime.utcnow().isoformat()
-    
-    return scan_data
 
-def delete_scheduled_scan(schedule_id: str) -> bool:
-    """Delete a scheduled scan"""
-    if schedule_id in scheduled_scans_store:
-        del scheduled_scans_store[schedule_id]
-        return True
-    return False
+def get_scheduled_scan(db: Session, user: User, schedule_id: int) -> Optional[ScheduledScan]:
+    return (
+        db.query(ScheduledScan)
+        .filter(ScheduledScan.id == schedule_id, ScheduledScan.user_id == user.id)
+        .first()
+    )
 
-def get_due_scans() -> List[Dict[str, Any]]:
-    """Get all scans that are due to run"""
-    now = datetime.utcnow()
-    due_scans = []
-    
-    for schedule_id, scan_data in scheduled_scans_store.items():
-        if not scan_data["enabled"]:
-            continue
-        
-        next_run = datetime.fromisoformat(scan_data["next_run"])
-        if next_run <= now:
-            due_scans.append(scan_data)
-    
-    return due_scans
 
-def mark_scan_completed(schedule_id: str, scan_result: Dict[str, Any]) -> None:
-    """Mark a scheduled scan as completed and schedule next run"""
-    if schedule_id not in scheduled_scans_store:
+def claim_due_scans(db: Session, now: Optional[datetime] = None) -> List[int]:
+    """Atomically move each due schedule to its next slot, returning those we won."""
+    now = now or datetime.utcnow()
+    due = (
+        db.query(ScheduledScan.id, ScheduledScan.next_run, ScheduledScan.frequency)
+        .filter(ScheduledScan.enabled.is_(True), ScheduledScan.next_run <= now)
+        .all()
+    )
+    claimed = []
+    for schedule_id, next_run, frequency in due:
+        result = db.execute(
+            update(ScheduledScan)
+            .where(ScheduledScan.id == schedule_id, ScheduledScan.next_run == next_run)
+            .values(next_run=next_run_after(now, frequency))
+        )
+        db.commit()
+        if result.rowcount == 1:
+            claimed.append(schedule_id)
+    return claimed
+
+
+def execute_schedule(db: Session, schedule_id: int) -> None:
+    """Run one claimed schedule and notify its channels."""
+    schedule = db.get(ScheduledScan, schedule_id)
+    if schedule is None:
         return
-    
-    scan_data = scheduled_scans_store[schedule_id]
+    user = db.get(User, schedule.user_id)
     now = datetime.utcnow()
-    
-    # Update run statistics
-    scan_data["last_run"] = now.isoformat()
-    scan_data["run_count"] += 1
-    scan_data["last_result"] = {
-        "timestamp": now.isoformat(),
-        "vulnerabilities_found": scan_result.get("count", 0),
-        "security_score": scan_result.get("security_score", {}).get("score", 0),
-        "status": "SUCCESS"
-    }
-    
-    # Schedule next run
-    frequency = scan_data["frequency"]
-    if frequency == ScanFrequency.DAILY:
-        next_run = now + timedelta(days=1)
-    elif frequency == ScanFrequency.WEEKLY:
-        next_run = now + timedelta(weeks=1)
-    else:  # MONTHLY
-        next_run = now + timedelta(days=30)
-    
-    scan_data["next_run"] = next_run.isoformat()
-    
-    print(f"📅 Completed scheduled scan: {scan_data['repo']} - Next run: {next_run}")
 
-def get_schedule_statistics() -> Dict[str, Any]:
-    """Get overall scheduling statistics"""
-    total_schedules = len(scheduled_scans_store)
-    active_schedules = len([s for s in scheduled_scans_store.values() if s["enabled"]])
-    
-    # Count by frequency
-    frequency_counts = {}
-    for scan_data in scheduled_scans_store.values():
-        freq = scan_data["frequency"]
-        frequency_counts[freq] = frequency_counts.get(freq, 0) + 1
-    
-    # Count by notification channel
-    channel_counts = {}
-    for scan_data in scheduled_scans_store.values():
-        for channel in scan_data["notification_channels"]:
-            ch_type = channel.get("type", "unknown")
-            channel_counts[ch_type] = channel_counts.get(ch_type, 0) + 1
-    
-    return {
-        "total_schedules": total_schedules,
-        "active_schedules": active_schedules,
-        "paused_schedules": total_schedules - active_schedules,
-        "frequency_breakdown": frequency_counts,
-        "notification_channels": channel_counts
-    }
+    if not get_billing_manager(db).can_use_scheduled_scans(user.id):
+        schedule.enabled = False
+        schedule.last_result = json.dumps(
+            {
+                "timestamp": now.isoformat(),
+                "status": "PAUSED",
+                "message": "Scheduled scans are not included in the current plan.",
+            }
+        )
+        db.commit()
+        return
+
+    try:
+        result = run_scan(db, user, schedule.repo_name, trigger="scheduled")
+        outcome = {
+            "timestamp": now.isoformat(),
+            "status": "SUCCESS",
+            "vulnerabilities_found": result["count"],
+            "security_score": result["security_score"]["score"],
+        }
+        channels = json.loads(schedule.notification_channels or "[]")
+        outcome["notifications"] = send_notifications(channels, result, schedule.repo_name)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Scheduled scan %s failed: %s", schedule_id, redact(exc))
+        outcome = {"timestamp": now.isoformat(), "status": "FAILED", "message": redact(exc)}
+
+    schedule.last_run = now
+    schedule.run_count = (schedule.run_count or 0) + 1
+    schedule.last_result = json.dumps(outcome)
+    db.commit()
+
+
+def run_due_scans() -> int:
+    """One scheduler tick. Returns how many schedules ran."""
+    db = SessionLocal()
+    try:
+        claimed = claim_due_scans(db)
+        for schedule_id in claimed:
+            execute_schedule(db, schedule_id)
+        return len(claimed)
+    finally:
+        db.close()
+
+
+class SchedulerThread:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="fixsec-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(settings.SCHEDULER_INTERVAL_SECONDS):
+            try:
+                run_due_scans()
+                get_workspace_manager().cleanup_old_workspaces()
+            except Exception:
+                logger.exception("Scheduler tick failed")

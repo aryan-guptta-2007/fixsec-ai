@@ -1,97 +1,50 @@
 "use client";
 
-type PRResult = {
-  status: string;
-  url?: string;
-  message?: string;
-  repo?: string;
-};
+import { PRResult } from "../../lib/api";
 
 type Props = {
-  isOpen: boolean;
-  onClose: () => void;
   result: PRResult | null;
+  onClose: () => void;
 };
 
-export default function PRResultModal({ isOpen, onClose, result }: Props) {
-  if (!isOpen || !result) return null;
+export default function PRResultModal({ result, onClose }: Props) {
+  if (!result) return null;
 
-  const getResultType = () => {
-    const status = result.status || "";
-    if (status.includes("PR Created")) return "created";
-    if (status.includes("already exists")) return "exists";
-    if (status.includes("No changes") || status.includes("No dependency") || status.includes("No auto-fixable")) return "no-changes";
-    return "success";
-  };
-
-  const resultType = getResultType();
-
-  const getIcon = () => {
-    switch (resultType) {
-      case "created": return "🎉";
-      case "exists": return "✅";
-      case "no-changes": return "ℹ️";
-      default: return "✅";
-    }
-  };
-
-  const getTitle = () => {
-    switch (resultType) {
-      case "created": return "Pull Request Created!";
-      case "exists": return "Pull Request Already Exists";
-      case "no-changes": return "No Changes Needed";
-      default: return "Success";
-    }
-  };
-
-  const getMessage = () => {
-    switch (resultType) {
-      case "created": 
-        return "A new pull request has been created with security fixes. Review and merge when ready.";
-      case "exists": 
-        return "A pull request with security fixes already exists for this repository. You can review or update it.";
-      case "no-changes": 
-        return result.message || "Your repository is already secure with the current scanning rules.";
-      default: 
-        return result.status || "Operation completed successfully.";
-    }
-  };
-
-  const getButtonText = () => {
-    switch (resultType) {
-      case "created": return "🔗 Open New PR";
-      case "exists": return "🔗 Open Existing PR";
-      default: return "Close";
-    }
-  };
-
-  const getButtonColor = () => {
-    switch (resultType) {
-      case "created": return "bg-green-600 hover:bg-green-700";
-      case "exists": return "bg-blue-600 hover:bg-blue-700";
-      default: return "bg-gray-600 hover:bg-gray-700";
-    }
-  };
+  const created = result.status === "PR Created";
+  const updated = result.status === "PR Updated";
+  const envVars = result.env_vars || [];
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-xl max-w-md w-full p-6">
-        {/* Header */}
+      <div role="dialog" aria-modal="true" className="bg-white rounded-xl max-w-md w-full p-6">
         <div className="text-center mb-6">
-          <div className="text-4xl mb-3">{getIcon()}</div>
-          <h2 className="text-xl font-bold text-gray-900 mb-2">{getTitle()}</h2>
-          <p className="text-gray-600">{getMessage()}</p>
+          <div className="text-4xl mb-3">{created || updated ? "🎉" : "ℹ️"}</div>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">
+            {created ? "Pull Request Created" : updated ? "Pull Request Updated" : result.status}
+          </h2>
+          <p className="text-gray-600">
+            {created || updated
+              ? `${result.fixes_applied} fix(es) applied. Review the pull request before merging.`
+              : result.message}
+          </p>
         </div>
 
-        {/* Additional Info */}
-        {result.repo && (
-          <div className="bg-gray-50 rounded-lg p-3 mb-6">
-            <div className="text-sm text-gray-600">Repository:</div>
-            <div className="font-medium text-gray-900">{result.repo}</div>
+        {envVars.length > 0 && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-800">
+            <p className="font-semibold mb-1">Before merging:</p>
+            <p>
+              Set {envVars.join(", ")} wherever the app runs, and rotate those credentials. They
+              remain in your git history.
+            </p>
           </div>
         )}
 
-        {/* Actions */}
+        {!!result.requires_review && (created || updated) && (
+          <p className="text-sm text-gray-600 mb-4">
+            {result.requires_review} issue(s) still need manual review. They are listed in the PR.
+          </p>
+        )}
+
         <div className="flex gap-3">
           <button
             onClick={onClose}
@@ -99,17 +52,15 @@ export default function PRResultModal({ isOpen, onClose, result }: Props) {
           >
             Close
           </button>
-          
           {result.url && (
-            <button
-              onClick={() => {
-                window.open(result.url, "_blank");
-                onClose();
-              }}
-              className={`flex-1 px-4 py-2 rounded-lg text-white font-semibold transition ${getButtonColor()}`}
+            <a
+              href={result.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 px-4 py-2 rounded-lg text-white text-center font-semibold bg-green-600 hover:bg-green-700 transition"
             >
-              {getButtonText()}
-            </button>
+              Open PR
+            </a>
           )}
         </div>
       </div>

@@ -1,464 +1,488 @@
 """
-Smart Auto-Fix Engine for FixSec AI
-The core differentiator that makes us better than Snyk/Dependabot
+Auto-fix engine.
+
+A change is only made when it is known to be safe:
+
+* Hardcoded secrets in supported languages are replaced with an environment
+  lookup. The value itself is never written anywhere in the repository; the PR
+  documents the variable name in .env.example and tells the owner to rotate.
+* Vulnerable dependencies are updated with `npm audit fix`, without --force, so
+  breaking major upgrades stay a human decision.
+* Everything else goes to the review list with a concrete suggestion.
+
+Every edited file is re-parsed and restored if the edit broke it.
 """
-import re
+import ast
+import hashlib
+import logging
 import os
-import json
-from typing import Dict, List, Any, Tuple
-from pathlib import Path
+import re
+import shutil
+import subprocess
+from collections import defaultdict
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional
+
+from core.scanner.npm_audit import fix_dependencies
+from core.scanner.secrets import mask, public_finding
+
+logger = logging.getLogger(__name__)
+
+ENV_SYNTAX = {
+    ".py": 'os.environ["{}"]',
+    ".js": "process.env.{}",
+    ".jsx": "process.env.{}",
+    ".mjs": "process.env.{}",
+    ".cjs": "process.env.{}",
+    ".ts": "process.env.{}",
+    ".tsx": "process.env.{}",
+    ".rb": 'ENV["{}"]',
+    ".php": "getenv('{}')",
+}
+NODE_CHECKED = {".js", ".mjs", ".cjs"}
+BACKTICK_STRINGS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+PHP_CONSTANT_CONTEXT = re.compile(r"\b(const|public|private|protected|static)\b")
+ROTATE = "Rotate this credential: it is in the repository history and must be treated as exposed."
+
 
 class SmartFixer:
-    """
-    Advanced auto-fix engine that goes beyond simple npm audit
-    Fixes: secrets, SQL injection, insecure configs, dependencies
-    """
-    
     def __init__(self, repo_path: str):
-        self.repo_path = Path(repo_path)
-        self.fixes_applied = []
-        self.confidence_scores = {}
-        
-    def generate_comprehensive_fix_plan(self, vulnerabilities: List[Dict]) -> Dict[str, Any]:
-        """
-        Generate intelligent fix plan with confidence scores and explanations
-        This is our main competitive advantage over existing tools
-        """
-        fix_plan = {
-            "fixable_automatically": [],
-            "requires_review": [],
-            "total_fixes": 0,
-            "confidence_breakdown": {},
-            "estimated_time": "2-5 minutes",
-            "risk_assessment": "LOW"
-        }
-        
-        for vuln in vulnerabilities:
-            fix_info = self._analyze_vulnerability_fixability(vuln)
-            
-            if fix_info["auto_fixable"]:
-                fix_plan["fixable_automatically"].append({
-                    "vulnerability": vuln,
-                    "fix_method": fix_info["method"],
-                    "confidence": fix_info["confidence"],
-                    "explanation": fix_info["explanation"],
-                    "preview": fix_info["preview"]
-                })
+        self.repo_path = Path(repo_path).resolve()
+        self._env_names: Dict[str, str] = {}
+
+    # ------------------------------------------------------------------ planning
+
+    def generate_comprehensive_fix_plan(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Decide, per finding, whether it can be fixed safely and how."""
+        auto: List[Dict[str, Any]] = []
+        review: List[Dict[str, Any]] = []
+
+        for finding in findings:
+            analysis = self._analyze(finding)
+            if analysis["auto_fixable"]:
+                auto.append(
+                    {
+                        "vulnerability": public_finding(finding),
+                        "fix_method": analysis["method"],
+                        "confidence": analysis["confidence"],
+                        "risk_level": "LOW" if analysis["confidence"] >= 90 else "MEDIUM",
+                        "explanation": analysis["explanation"],
+                        "preview": analysis["preview"],
+                        "diff": analysis.get("diff"),
+                        "_finding": finding,
+                        "_env_name": analysis.get("env_name"),
+                    }
+                )
             else:
-                fix_plan["requires_review"].append({
-                    "vulnerability": vuln,
-                    "reason": fix_info["reason"],
-                    "suggested_action": fix_info["suggestion"]
-                })
-        
-        fix_plan["total_fixes"] = len(fix_plan["fixable_automatically"])
-        fix_plan["risk_assessment"] = self._calculate_overall_risk(fix_plan["fixable_automatically"])
-        
-        return fix_plan
-    
-    def _analyze_vulnerability_fixability(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Analyze if vulnerability can be auto-fixed and how
-        Returns confidence score and fix method
-        """
-        vuln_type = vuln.get("type", "").lower()
-        severity = vuln.get("severity", "").upper()
-        file_path = vuln.get("file_path", "")
-        
-        if "dependency" in vuln_type or "insecure dependency" in vuln_type:
-            return self._analyze_dependency_fix(vuln)
-        elif "secret" in vuln_type or "hardcoded" in vuln_type:
-            return self._analyze_secret_fix(vuln)
-        elif "sql injection" in vuln_type:
-            return self._analyze_sql_injection_fix(vuln)
-        elif "config" in vuln_type or "cors" in vuln_type:
-            return self._analyze_config_fix(vuln)
-        else:
+                review.append(
+                    {
+                        "vulnerability": public_finding(finding),
+                        "reason": analysis["reason"],
+                        "suggested_action": analysis["suggestion"],
+                    }
+                )
+
+        return {
+            "fixable_automatically": auto,
+            "requires_review": review,
+            "total_fixes": len(auto),
+            "estimated_time": f"About {max(1, len(auto) + 5 * len(review))} minutes to review",
+            "risk_assessment": self._overall_risk(auto),
+        }
+
+    def _analyze(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        category = finding.get("category")
+        if category == "dependency":
+            return self._analyze_dependency(finding)
+        if category == "secret":
+            return self._analyze_secret(finding)
+        if category == "sql_injection":
             return {
                 "auto_fixable": False,
-                "reason": "Unknown vulnerability type",
-                "suggestion": "Manual review required",
-                "confidence": 0
+                "reason": "Rewriting a query safely needs knowledge of the database driver "
+                "and the surrounding code.",
+                "suggestion": f"Use a parameterized query, for example: {finding.get('suggested_fix')}",
             }
-    
-    def _analyze_dependency_fix(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Analyze npm/dependency vulnerabilities for auto-fixing
-        High confidence - we know how to fix these
-        """
-        package_name = vuln.get("package", "unknown")
-        
         return {
-            "auto_fixable": True,
-            "method": "npm_audit_fix",
-            "confidence": 95,
-            "explanation": f"Update {package_name} to latest secure version using npm audit fix",
-            "preview": f"package.json: {package_name} → latest secure version",
-            "risk_level": "LOW"
+            "auto_fixable": False,
+            "reason": "No automatic fix exists for this issue type.",
+            "suggestion": "Review this finding manually.",
         }
-    
-    def _analyze_secret_fix(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Analyze hardcoded secrets for auto-fixing
-        Medium confidence - can move to .env but needs validation
-        """
-        file_path = vuln.get("file_path", "")
-        message = vuln.get("message", "")
-        
-        # Detect secret type
-        if "sk_live_" in message or "sk_test_" in message:
-            secret_type = "STRIPE_SECRET_KEY"
-        elif "JWT_SECRET" in message:
-            secret_type = "JWT_SECRET"
-        elif "PRIVATE_KEY" in message:
-            secret_type = "PRIVATE_KEY"
-        elif "AIza" in message:
-            secret_type = "GOOGLE_API_KEY"
+
+    def _analyze_dependency(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        package = finding.get("package", "this package")
+        if finding.get("fixable"):
+            return {
+                "auto_fixable": True,
+                "method": "npm_audit_fix",
+                "confidence": 90,
+                "explanation": f"Update {package} to a patched, non-breaking version with npm audit fix.",
+                "preview": f"{finding['file_path']}: {package} updated to a patched version",
+            }
+        if finding.get("breaking_fix"):
+            reason = f"The fix for {package} is a major version upgrade that may break your code."
+            suggestion = f"Upgrade {package} deliberately and run your test suite."
+        elif finding.get("pinned") and finding.get("fix_available"):
+            reason = f"{package} is pinned to an exact version in package.json."
+            suggestion = f"Update the version of {package} in package.json to a patched release."
+        elif not finding.get("has_lockfile", True):
+            reason = "This project has no package-lock.json, so it may use another package manager."
+            suggestion = "Run your package manager's audit fix, or commit a package-lock.json."
         else:
-            secret_type = "SECRET_VALUE"
-        
+            reason = f"No patched version of {package} is available yet."
+            suggestion = "Check the advisory for workarounds or replace the package."
+        return {"auto_fixable": False, "reason": reason, "suggestion": suggestion}
+
+    def _analyze_secret(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        def review(reason: str, suggestion: str = "") -> Dict[str, Any]:
+            return {
+                "auto_fixable": False,
+                "reason": reason,
+                "suggestion": suggestion or f"Move it to an environment variable. {ROTATE}",
+            }
+
+        raw, span = finding.get("_raw"), finding.get("_span")
+        if not raw or not span:
+            return review(
+                "Key material cannot be replaced with a single environment lookup.",
+                f"Remove the key from the repository and load it at runtime. {ROTATE}",
+            )
+        if finding.get("type") == "Potential Secret":
+            return review("This looks like a secret but could be a harmless identifier.")
+
+        relative = finding["file_path"]
+        suffix = PurePosixPath(relative).suffix
+        template = ENV_SYNTAX.get(suffix)
+        if template is None:
+            return review(
+                "Configuration files cannot read environment variables in a portable way.",
+                f"Remove the value from this file and inject it at deploy time. {ROTATE}",
+            )
+
+        try:
+            lines = self._read_lines(relative)
+            line = lines[finding["line_number"] - 1]
+        except (OSError, IndexError, UnicodeDecodeError, ValueError):
+            return review("The file could not be read for an exact edit.")
+
+        start, end = span
+        quote = line[start - 1] if start > 0 else ""
+        allowed = "\"'`" if suffix in BACKTICK_STRINGS else "\"'"
+        is_whole_literal = (
+            line[start:end] == raw
+            and quote
+            and quote in allowed
+            and line[end:end + 1] == quote
+            and not (start >= 2 and (line[start - 2].isalnum() or line[start - 2] in "\"'"))
+        )
+        if not is_whole_literal:
+            return review("The secret is embedded in a larger string, so it needs a manual edit.")
+        if suffix == ".php" and PHP_CONSTANT_CONTEXT.search(line):
+            return review("PHP does not allow function calls in constant or property initialisers.")
+
+        env_name = self._env_name_for(raw, finding.get("_env_name"))
+        replacement = template.format(env_name)
+        before = line.replace(raw, mask(raw)).strip()
+        after = (line[:start - 1] + replacement + line[end + 1:]).strip()
         return {
             "auto_fixable": True,
             "method": "move_to_env",
             "confidence": 85,
-            "explanation": f"Move hardcoded {secret_type} to .env file and reference via process.env",
-            "preview": f"{file_path}: hardcoded value → process.env.{secret_type}",
-            "risk_level": "LOW",
-            "env_var_name": secret_type
-        }
-    
-    def _analyze_sql_injection_fix(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Analyze SQL injection vulnerabilities for auto-fixing
-        Medium confidence - can fix basic cases
-        """
-        file_path = vuln.get("file_path", "")
-        line_number = vuln.get("line_number", 0)
-        
-        return {
-            "auto_fixable": True,
-            "method": "parameterized_query",
-            "confidence": 75,
-            "explanation": "Convert string concatenation to parameterized query to prevent SQL injection",
-            "preview": f"{file_path}:{line_number}: Direct query → Parameterized query",
-            "risk_level": "MEDIUM"
-        }
-    
-    def _analyze_config_fix(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Analyze configuration vulnerabilities for auto-fixing
-        High confidence - standard security configs
-        """
-        return {
-            "auto_fixable": True,
-            "method": "secure_config",
-            "confidence": 90,
-            "explanation": "Apply secure configuration defaults (CORS, JWT expiry, etc.)",
-            "preview": "Update security configuration to recommended values",
-            "risk_level": "LOW"
-        }
-    
-    def _calculate_overall_risk(self, fixes: List[Dict]) -> str:
-        """
-        Calculate overall risk of applying all fixes
-        """
-        if not fixes:
-            return "NONE"
-        
-        avg_confidence = sum(fix["confidence"] for fix in fixes) / len(fixes)
-        
-        if avg_confidence >= 90:
-            return "LOW"
-        elif avg_confidence >= 75:
-            return "MEDIUM"
-        else:
-            return "HIGH"
-    
-    def apply_smart_fixes(self, fix_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Apply all auto-fixable vulnerabilities with smart logic
-        This is where we beat competitors with superior fixing
-        """
-        results = {
-            "fixes_applied": 0,
-            "fixes_failed": 0,
-            "changes": [],
-            "new_files": [],
-            "modified_files": []
-        }
-        
-        for fix_item in fix_plan["fixable_automatically"]:
-            try:
-                fix_result = self._apply_single_fix(fix_item)
-                if fix_result["success"]:
-                    results["fixes_applied"] += 1
-                    results["changes"].append(fix_result)
-                    if fix_result.get("file_modified"):
-                        results["modified_files"].append(fix_result["file_modified"])
-                    if fix_result.get("file_created"):
-                        results["new_files"].append(fix_result["file_created"])
-                else:
-                    results["fixes_failed"] += 1
-            except Exception as e:
-                results["fixes_failed"] += 1
-                print(f"Fix failed: {e}")
-        
-        return results
-    
-    def _apply_single_fix(self, fix_item: Dict) -> Dict[str, Any]:
-        """
-        Apply a single fix based on the fix method
-        """
-        method = fix_item["fix_method"]
-        vuln = fix_item["vulnerability"]
-        
-        if method == "npm_audit_fix":
-            return self._fix_npm_vulnerabilities()
-        elif method == "move_to_env":
-            return self._fix_hardcoded_secret(vuln, fix_item)
-        elif method == "parameterized_query":
-            return self._fix_sql_injection(vuln)
-        elif method == "secure_config":
-            return self._fix_insecure_config(vuln)
-        else:
-            return {"success": False, "error": f"Unknown fix method: {method}"}
-    
-    def _fix_npm_vulnerabilities(self) -> Dict[str, Any]:
-        """
-        Fix npm vulnerabilities using audit fix
-        Enhanced version that handles lockfiles properly
-        """
-        import subprocess
-        
-        try:
-            # Run npm audit fix with force flag for automatic fixes
-            result = subprocess.run(
-                ["npm", "audit", "fix", "--force"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            
-            if result.returncode == 0:
-                return {
-                    "success": True,
-                    "method": "npm_audit_fix",
-                    "description": "Updated vulnerable dependencies to secure versions",
-                    "file_modified": "package.json",
-                    "details": result.stdout
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"npm audit fix failed: {result.stderr}"
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"npm audit fix error: {str(e)}"
-            }
-    
-    def _fix_hardcoded_secret(self, vuln: Dict, fix_item: Dict) -> Dict[str, Any]:
-        """
-        Move hardcoded secrets to .env file
-        This is a key differentiator - competitors don't do this well
-        """
-        file_path = self.repo_path / vuln.get("file_path", "").lstrip("/")
-        line_number = vuln.get("line_number", 0)
-        env_var_name = fix_item.get("env_var_name", "SECRET_VALUE")
-        
-        try:
-            if not file_path.exists():
-                return {"success": False, "error": f"File not found: {file_path}"}
-            
-            # Read the file
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            if line_number <= 0 or line_number > len(lines):
-                return {"success": False, "error": f"Invalid line number: {line_number}"}
-            
-            # Extract the secret value
-            line = lines[line_number - 1]
-            secret_value = self._extract_secret_value(line)
-            
-            if not secret_value:
-                return {"success": False, "error": "Could not extract secret value"}
-            
-            # Replace with environment variable reference
-            new_line = self._replace_with_env_var(line, secret_value, env_var_name)
-            lines[line_number - 1] = new_line
-            
-            # Write back to file
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            
-            # Add to .env file
-            self._add_to_env_file(env_var_name, secret_value)
-            
-            return {
-                "success": True,
-                "method": "move_to_env",
-                "description": f"Moved {env_var_name} to .env file",
-                "file_modified": str(file_path.relative_to(self.repo_path)),
-                "file_created": ".env",
-                "env_var": env_var_name
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Secret fix error: {str(e)}"
-            }
-    
-    def _extract_secret_value(self, line: str) -> str:
-        """
-        Extract secret value from code line
-        """
-        # Common patterns for secrets
-        patterns = [
-            r'["\']([sk_live_|sk_test_][a-zA-Z0-9]+)["\']',
-            r'["\']([A-Za-z0-9_-]{32,})["\']',
-            r':\s*["\']([^"\']+)["\']',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, line)
-            if match:
-                return match.group(1)
-        
-        return ""
-    
-    def _replace_with_env_var(self, line: str, secret_value: str, env_var_name: str) -> str:
-        """
-        Replace hardcoded secret with environment variable reference
-        """
-        # Replace the secret value with process.env reference
-        new_line = line.replace(f'"{secret_value}"', f'process.env.{env_var_name}')
-        new_line = new_line.replace(f"'{secret_value}'", f'process.env.{env_var_name}')
-        
-        return new_line
-    
-    def _add_to_env_file(self, env_var_name: str, secret_value: str):
-        """
-        Add environment variable to .env file
-        """
-        env_file = self.repo_path / ".env"
-        
-        # Read existing .env if it exists
-        existing_vars = {}
-        if env_file.exists():
-            with open(env_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if '=' in line and not line.strip().startswith('#'):
-                        key, value = line.strip().split('=', 1)
-                        existing_vars[key] = value
-        
-        # Add new variable
-        existing_vars[env_var_name] = secret_value
-        
-        # Write back to .env
-        with open(env_file, 'w', encoding='utf-8') as f:
-            f.write("# Environment variables for FixSec AI\n")
-            f.write("# Add this file to .gitignore to keep secrets secure\n\n")
-            for key, value in existing_vars.items():
-                f.write(f"{key}={value}\n")
-    
-    def _fix_sql_injection(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Fix SQL injection by converting to parameterized queries
-        Basic implementation for common patterns
-        """
-        file_path = self.repo_path / vuln.get("file_path", "").lstrip("/")
-        line_number = vuln.get("line_number", 0)
-        
-        try:
-            if not file_path.exists():
-                return {"success": False, "error": f"File not found: {file_path}"}
-            
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            if line_number <= 0 or line_number > len(lines):
-                return {"success": False, "error": f"Invalid line number: {line_number}"}
-            
-            line = lines[line_number - 1]
-            
-            # Basic SQL injection fix patterns
-            if "${" in line and "SELECT" in line.upper():
-                # Template literal injection
-                new_line = self._fix_template_literal_sql(line)
-            elif "+" in line and ("SELECT" in line.upper() or "WHERE" in line.upper()):
-                # String concatenation injection
-                new_line = self._fix_concatenation_sql(line)
-            else:
-                return {"success": False, "error": "SQL injection pattern not recognized"}
-            
-            lines[line_number - 1] = new_line
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            
-            return {
-                "success": True,
-                "method": "parameterized_query",
-                "description": "Converted to parameterized query to prevent SQL injection",
-                "file_modified": str(file_path.relative_to(self.repo_path)),
-                "old_line": line.strip(),
-                "new_line": new_line.strip()
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"SQL injection fix error: {str(e)}"
-            }
-    
-    def _fix_template_literal_sql(self, line: str) -> str:
-        """
-        Fix template literal SQL injection
-        """
-        # Convert `SELECT * FROM users WHERE id = ${userId}` 
-        # to `SELECT * FROM users WHERE id = ?` with parameters
-        
-        # This is a simplified fix - in production, you'd want more sophisticated parsing
-        if "WHERE id = ${" in line:
-            line = re.sub(r'\$\{[^}]+\}', '?', line)
-            line = line + "  // TODO: Use parameterized query with user input as parameter\n"
-        
-        return line
-    
-    def _fix_concatenation_sql(self, line: str) -> str:
-        """
-        Fix string concatenation SQL injection
-        """
-        # Convert "SELECT * FROM users WHERE id = " + userId
-        # to parameterized query pattern
-        
-        if " + " in line and ("SELECT" in line.upper() or "WHERE" in line.upper()):
-            # Replace concatenation with placeholder
-            line = re.sub(r'\s*\+\s*[^;]+', ' + "?"  // TODO: Use parameterized query', line)
-        
-        return line
-    
-    def _fix_insecure_config(self, vuln: Dict) -> Dict[str, Any]:
-        """
-        Fix insecure configuration issues
-        """
-        # This would implement fixes for common config issues like:
-        # - Weak CORS settings
-        # - Missing JWT expiry
-        # - Insecure cookie settings
-        # - Missing security headers
-        
-        return {
-            "success": True,
-            "method": "secure_config",
-            "description": "Applied secure configuration defaults",
-            "file_modified": "config file"
+            "explanation": f"Read {env_name} from the environment instead of hardcoding it.",
+            "preview": f"{relative}:{finding['line_number']}: hardcoded value replaced with {replacement}",
+            "diff": {"before": before, "after": after},
+            "env_name": env_name,
         }
 
+    def _env_name_for(self, value: str, preferred: Optional[str]) -> str:
+        """One variable per distinct secret, even when two share a natural name."""
+        if value in self._env_names:
+            return self._env_names[value]
+        base = re.sub(r"[^A-Z0-9_]", "_", (preferred or "APP_SECRET").upper()).strip("_")
+        if not base or base[0].isdigit():
+            base = f"APP_{base}"
+        name, suffix = base, 2
+        while name in self._env_names.values():
+            name, suffix = f"{base}_{suffix}", suffix + 1
+        self._env_names[value] = name
+        return name
+
+    @staticmethod
+    def _overall_risk(fixes: List[Dict[str, Any]]) -> str:
+        if not fixes:
+            return "NONE"
+        average = sum(fix["confidence"] for fix in fixes) / len(fixes)
+        return "LOW" if average >= 90 else "MEDIUM"
+
+    # ----------------------------------------------------------------- file access
+
+    def _resolve(self, relative: str) -> Path:
+        candidate = (self.repo_path / relative).resolve()
+        if not candidate.is_relative_to(self.repo_path):
+            raise ValueError(f"Path escapes the repository: {relative}")
+        return candidate
+
+    def _read_lines(self, relative: str) -> List[str]:
+        with open(self._resolve(relative), "r", encoding="utf-8", newline="") as handle:
+            return list(handle)
+
+    # ------------------------------------------------------------------- applying
+
+    def apply_smart_fixes(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the plan. Only changes that really happened are reported as applied."""
+        results: Dict[str, Any] = {
+            "fixes_applied": 0,
+            "fixes_failed": 0,
+            "applied": [],
+            "failed": [],
+            "modified_files": [],
+            "env_vars": [],
+        }
+
+        secret_fixes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        dependency_fixes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for item in plan["fixable_automatically"]:
+            finding = item["_finding"]
+            if item["fix_method"] == "move_to_env":
+                secret_fixes[finding["file_path"]].append(item)
+            else:
+                dependency_fixes[finding["package_dir"]].append(item)
+
+        for relative, items in secret_fixes.items():
+            self._apply_secret_fixes(relative, items, results)
+        for package_dir, items in dependency_fixes.items():
+            self._apply_dependency_fixes(package_dir, items, results)
+
+        if results["env_vars"]:
+            self._document_env_vars(results)
+        return results
+
+    def _record(self, results: Dict[str, Any], items: List[Dict[str, Any]], error: Optional[str]) -> None:
+        for item in items:
+            if error:
+                results["fixes_failed"] += 1
+                results["failed"].append({**self._summary(item), "error": error})
+            else:
+                results["fixes_applied"] += 1
+                results["applied"].append(self._summary(item))
+
+    @staticmethod
+    def _summary(item: Dict[str, Any]) -> Dict[str, Any]:
+        vulnerability = item["vulnerability"]
+        return {
+            "type": vulnerability["type"],
+            "category": vulnerability["category"],
+            "file": vulnerability["file_path"],
+            "line": vulnerability.get("line_number"),
+            "description": item["explanation"],
+        }
+
+    def _apply_secret_fixes(
+        self, relative: str, items: List[Dict[str, Any]], results: Dict[str, Any]
+    ) -> None:
+        path = self._resolve(relative)
+        original = path.read_bytes()
+        lines = self._read_lines(relative)
+        suffix = path.suffix
+
+        # Right to left, so earlier spans on a line stay valid.
+        ordered = sorted(
+            items,
+            key=lambda i: (i["_finding"]["line_number"], i["_finding"]["_span"][0]),
+            reverse=True,
+        )
+        for item in ordered:
+            finding = item["_finding"]
+            index = finding["line_number"] - 1
+            start, end = finding["_span"]
+            line = lines[index]
+            replacement = ENV_SYNTAX[suffix].format(item["_env_name"])
+            lines[index] = line[:start - 1] + replacement + line[end + 1:]
+
+        text = "".join(lines)
+        if suffix == ".py":
+            text = self._ensure_python_import(text)
+
+        node_baseline = suffix in NODE_CHECKED and self._node_accepts(path)
+        path.write_bytes(text.encode("utf-8"))
+        if not self._still_parses(path, suffix, node_baseline):
+            path.write_bytes(original)
+            self._record(results, items, "The edit would have broken the file, so it was reverted.")
+            return
+
+        self._record(results, items, None)
+        results["modified_files"].append(relative)
+        for item in items:
+            if item["_env_name"] not in results["env_vars"]:
+                results["env_vars"].append(item["_env_name"])
+
+    @staticmethod
+    def _ensure_python_import(text: str) -> str:
+        if re.search(r"^\s*import\s+(?:[\w.]+\s*,\s*)*os\b", text, re.MULTILINE):
+            return text
+        newline = "\r\n" if "\r\n" in text else "\n"
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return text  # reported by the post-edit check
+        insert_at = 0
+        for node in tree.body:
+            is_docstring = (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            )
+            is_future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            if not (is_docstring or is_future):
+                break
+            insert_at = node.end_lineno
+        lines = text.splitlines(keepends=True)
+        lines.insert(insert_at, f"import os{newline}")
+        return "".join(lines)
+
+    @staticmethod
+    def _node_accepts(path: Path) -> bool:
+        node = shutil.which("node")
+        if node is None:
+            return False
+        try:
+            # --check only parses, so repository code is not executed.
+            result = subprocess.run(
+                [node, "--check", str(path)],
+                capture_output=True,
+                timeout=20,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
+    def _still_parses(self, path: Path, suffix: str, node_baseline: bool) -> bool:
+        if suffix == ".py":
+            try:
+                ast.parse(path.read_text(encoding="utf-8"))
+                return True
+            except (SyntaxError, ValueError):
+                return False
+        # Node cannot parse JSX or every module flavour, so only trust it when it
+        # accepted the file before the edit.
+        return self._node_accepts(path) if node_baseline else True
+
+    def _apply_dependency_fixes(
+        self, package_dir: str, items: List[Dict[str, Any]], results: Dict[str, Any]
+    ) -> None:
+        tracked = [
+            "package.json" if package_dir == "." else f"{package_dir}/package.json",
+            "package-lock.json" if package_dir == "." else f"{package_dir}/package-lock.json",
+        ]
+
+        def fingerprint() -> Dict[str, str]:
+            return {
+                name: hashlib.sha256(self._resolve(name).read_bytes()).hexdigest()
+                for name in tracked
+                if self._resolve(name).exists()
+            }
+
+        before = fingerprint()
+        remaining = fix_dependencies(str(self.repo_path), package_dir)
+        after = fingerprint()
+        changed = [name for name in tracked if before.get(name) != after.get(name)]
+
+        if remaining is None or not changed:
+            self._record(results, items, "npm could not update this dependency automatically.")
+            return
+
+        fixed = [i for i in items if i["vulnerability"]["package"] not in remaining]
+        unfixed = [i for i in items if i["vulnerability"]["package"] in remaining]
+        self._record(results, fixed, None)
+        self._record(results, unfixed, "npm could not patch this without a breaking change.")
+        if fixed:
+            results["modified_files"].extend(changed)
+
+    def _document_env_vars(self, results: Dict[str, Any]) -> None:
+        example = self._resolve(".env.example")
+        existing = example.read_text(encoding="utf-8") if example.exists() else ""
+        known = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", existing, re.MULTILINE))
+        missing = [name for name in results["env_vars"] if name not in known]
+        if missing:
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            header = "" if existing else "# Copy to .env and fill in real values. Never commit .env.\n"
+            example.write_text(
+                existing + header + "".join(f"{name}=\n" for name in missing), encoding="utf-8"
+            )
+            results["modified_files"].append(".env.example")
+
+        gitignore = self._resolve(".gitignore")
+        content = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        patterns = {line.strip() for line in content.splitlines()}
+        if not patterns & {".env", ".env*", "*.env", "/.env"}:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            gitignore.write_text(content + ".env\n", encoding="utf-8")
+            results["modified_files"].append(".gitignore")
+
+
+def public_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """The plan without the raw secret material the fixer needs internally."""
+    return {
+        **plan,
+        "fixable_automatically": [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in plan["fixable_automatically"]
+        ],
+    }
+
+
+def build_commit_message(results: Dict[str, Any]) -> str:
+    secrets = sum(1 for fix in results["applied"] if fix["category"] == "secret")
+    dependencies = sum(1 for fix in results["applied"] if fix["category"] == "dependency")
+    lines = ["FixSec AI: security fixes", ""]
+    if secrets:
+        lines.append(f"- Replace {secrets} hardcoded secret(s) with environment variables")
+    if dependencies:
+        lines.append(f"- Update {dependencies} vulnerable dependency finding(s)")
+    return "\n".join(lines) + "\n"
+
+
+def build_pr_body(results: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    """Describe what actually changed, and what is still the reviewer's job."""
+    sections = ["FixSec AI generated this PR. Please review it before merging.", "", "## Changes"]
+    for fix in results["applied"]:
+        location = f"`{fix['file']}`" + (f" line {fix['line']}" if fix["line"] else "")
+        sections.append(f"- {location}: {fix['description']}")
+
+    if results["env_vars"]:
+        sections += [
+            "",
+            "## Required before merging",
+            "",
+            "**1. Set these environment variables** wherever the app runs, or it will fail at "
+            "startup. They are listed in `.env.example`; no secret values are in this PR.",
+            "",
+        ]
+        sections += [f"- `{name}`" for name in results["env_vars"]]
+        sections += [
+            "",
+            "**2. Rotate every one of these credentials.** The old values stay in your git "
+            "history, so removing them from the code does not make them safe.",
+        ]
+
+    if results["failed"]:
+        sections += ["", "## Could not be fixed automatically"]
+        for fix in results["failed"]:
+            sections.append(f"- `{fix['file']}`: {fix['type']}. {fix['error']}")
+
+    if plan["requires_review"]:
+        sections += ["", "## Still needs manual review"]
+        for item in plan["requires_review"]:
+            vulnerability = item["vulnerability"]
+            line = vulnerability.get("line_number")
+            location = f"`{vulnerability['file_path']}`" + (f" line {line}" if line else "")
+            sections.append(f"- {location}: {vulnerability['type']}. {item['suggested_action']}")
+
+    return "\n".join(sections) + "\n"
+
+
 def get_smart_fixer(repo_path: str) -> SmartFixer:
-    """Factory function to create SmartFixer instance"""
     return SmartFixer(repo_path)

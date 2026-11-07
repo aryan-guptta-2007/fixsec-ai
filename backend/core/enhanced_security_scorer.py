@@ -3,7 +3,14 @@ Enhanced Security Scoring System
 "Security Score that actually matters" - based on real risk impact
 """
 from typing import Dict, List, Any, Tuple
-from datetime import datetime
+
+from core.scanner.files import is_test_path
+
+
+# npm reports every transitive package separately, so one outdated framework can
+# produce dozens of findings. Past this point, more of them say little new.
+DEPENDENCY_DEDUCTION_CAP = 50.0
+
 
 class EnhancedSecurityScorer:
     """
@@ -19,72 +26,65 @@ class EnhancedSecurityScorer:
         Calculate security score based on real impact factors
         Returns score, grade, and actionable recommendations
         """
-        # Base score starts at 100
-        score = 100.0
         impact_breakdown = {
-            "secrets": {"deduction": 0, "count": 0, "impact": "CRITICAL"},
-            "dependencies": {"deduction": 0, "count": 0, "impact": "HIGH"},
-            "sql_injection": {"deduction": 0, "count": 0, "impact": "CRITICAL"},
-            "config_issues": {"deduction": 0, "count": 0, "impact": "MEDIUM"},
-            "other": {"deduction": 0, "count": 0, "impact": "LOW"}
+            "secrets": {"deduction": 0.0, "count": 0, "impact": "CRITICAL"},
+            "dependencies": {"deduction": 0.0, "count": 0, "impact": "HIGH"},
+            "sql_injection": {"deduction": 0.0, "count": 0, "impact": "CRITICAL"},
+            "other": {"deduction": 0.0, "count": 0, "impact": "LOW"},
         }
-        
-        # Process each vulnerability with smart weighting
+        severity_breakdown: Dict[str, int] = {}
+        exposure = self._exposure_multiplier()
+
         for vuln in vulnerabilities:
             deduction, category = self._calculate_vulnerability_impact(vuln)
-            score -= deduction
-            impact_breakdown[category]["deduction"] += deduction
+            impact_breakdown[category]["deduction"] += deduction * exposure
             impact_breakdown[category]["count"] += 1
-        
-        # Apply repository context multipliers
-        score = self._apply_context_multipliers(score, vulnerabilities)
-        
-        # Ensure score is between 0-100
-        score = max(0, min(100, score))
-        
-        # Calculate grade
-        grade = self._calculate_grade(score)
-        
-        # Generate actionable recommendations
-        recommendations = self._generate_smart_recommendations(impact_breakdown, score)
-        
+            severity = vuln.get("severity", "UNKNOWN")
+            severity_breakdown[severity] = severity_breakdown.get(severity, 0) + 1
+
+        dependencies = impact_breakdown["dependencies"]
+        dependencies["deduction"] = min(dependencies["deduction"], DEPENDENCY_DEDUCTION_CAP)
+
+        total_deduction = sum(item["deduction"] for item in impact_breakdown.values())
+        score = max(0.0, 100.0 - total_deduction)
+
+        for item in impact_breakdown.values():
+            item["deduction"] = round(item["deduction"], 1)
+
         return {
             "score": round(score, 1),
-            "grade": grade,
+            "grade": self._calculate_grade(score),
             "impact_breakdown": impact_breakdown,
-            "recommendations": recommendations,
+            "severity_breakdown": severity_breakdown,
+            "total_vulnerabilities": len(vulnerabilities),
+            "recommendations": self._generate_smart_recommendations(impact_breakdown, score),
             "next_best_fixes": self._get_next_best_fixes(impact_breakdown),
             "time_to_a_plus": self._estimate_time_to_a_plus(impact_breakdown),
-            "risk_level": self._get_overall_risk_level(score)
+            "risk_level": self._get_overall_risk_level(score),
         }
-    
+
     def _calculate_vulnerability_impact(self, vuln: Dict) -> Tuple[float, str]:
         """
         Calculate impact score for individual vulnerability
         Based on real-world exploitation likelihood and damage
         """
-        vuln_type = vuln.get("type", "").lower()
-        severity = vuln.get("severity", "").upper()
+        category_name = vuln.get("category")
         confidence = vuln.get("confidence_score", 50)
         file_path = vuln.get("file_path", "")
-        
-        # Base impact by vulnerability type (real-world impact)
-        if "secret" in vuln_type or "hardcoded" in vuln_type:
+
+        if category_name == "secret":
             base_impact = self._calculate_secret_impact(vuln)
             category = "secrets"
-        elif "dependency" in vuln_type or "insecure dependency" in vuln_type:
+        elif category_name == "dependency":
             base_impact = self._calculate_dependency_impact(vuln)
             category = "dependencies"
-        elif "sql injection" in vuln_type:
+        elif category_name == "sql_injection":
             base_impact = self._calculate_sql_injection_impact(vuln)
             category = "sql_injection"
-        elif "config" in vuln_type or "cors" in vuln_type:
-            base_impact = self._calculate_config_impact(vuln)
-            category = "config_issues"
         else:
             base_impact = 5.0
             category = "other"
-        
+
         # Adjust by confidence (low confidence = lower impact)
         confidence_multiplier = confidence / 100.0
         
@@ -100,28 +100,18 @@ class EnhancedSecurityScorer:
         Calculate impact for hardcoded secrets
         Secrets are CRITICAL - can lead to complete compromise
         """
-        message = vuln.get("message", "").lower()
-        
-        # Production API keys = maximum impact
-        if any(key in message for key in ["sk_live_", "prod", "production"]):
-            return 25.0  # Huge impact
-        
-        # Test/development keys = high impact
-        elif any(key in message for key in ["sk_test_", "dev", "development"]):
-            return 15.0
-        
-        # Database credentials = critical impact
-        elif any(key in message for key in ["password", "db_", "database"]):
+        secret_type = vuln.get("type", "").lower()
+
+        if vuln.get("severity") == "CRITICAL":
+            return 25.0  # live keys and private keys
+        if "password" in secret_type:
             return 20.0
-        
-        # JWT secrets = high impact
-        elif "jwt" in message:
-            return 18.0
-        
-        # Generic secrets = medium-high impact
-        else:
-            return 12.0
-    
+        if "test" in secret_type:
+            return 15.0
+        if "potential" in secret_type:
+            return 8.0
+        return 12.0
+
     def _calculate_dependency_impact(self, vuln: Dict) -> float:
         """
         Calculate impact for vulnerable dependencies
@@ -155,22 +145,6 @@ class EnhancedSecurityScorer:
         else:
             return 18.0
     
-    def _calculate_config_impact(self, vuln: Dict) -> float:
-        """
-        Calculate impact for configuration issues
-        Usually medium impact but can be serious
-        """
-        message = vuln.get("message", "").lower()
-        
-        if "cors" in message:
-            return 8.0
-        elif "jwt" in message:
-            return 10.0
-        elif "ssl" in message or "tls" in message:
-            return 12.0
-        else:
-            return 6.0
-    
     def _get_file_criticality_multiplier(self, file_path: str) -> float:
         """
         Adjust impact based on file criticality
@@ -178,7 +152,7 @@ class EnhancedSecurityScorer:
         file_path = file_path.lower()
         
         # Test files = lower impact
-        if any(test in file_path for test in ["/test/", "/tests/", ".test.", ".spec."]):
+        if is_test_path(file_path):
             return 0.3
         
         # Config files = higher impact
@@ -197,26 +171,14 @@ class EnhancedSecurityScorer:
         else:
             return 1.0
     
-    def _apply_context_multipliers(self, score: float, vulnerabilities: List[Dict]) -> float:
-        """
-        Apply repository context to adjust score
-        Public repos = higher risk, Private repos = lower risk
-        """
-        is_public = self.repo_info.get("private", True) == False
-        has_many_stars = self.repo_info.get("stargazers_count", 0) > 100
-        
-        # Public repositories with many stars = higher risk
-        if is_public and has_many_stars:
-            # Reduce score more for public repos (higher risk)
-            multiplier = 0.9
-        elif is_public:
-            multiplier = 0.95
-        else:
-            # Private repos = slightly less risk
-            multiplier = 1.02
-        
-        return score * multiplier
-    
+    def _exposure_multiplier(self) -> float:
+        """Issues in public repositories are easier to find and exploit."""
+        if self.repo_info.get("private", True):
+            return 0.9
+        if self.repo_info.get("stargazers_count", 0) > 100:
+            return 1.2
+        return 1.1
+
     def _calculate_grade(self, score: float) -> str:
         """
         Convert score to letter grade
@@ -271,12 +233,6 @@ class EnhancedSecurityScorer:
             recommendations.append(
                 f"⚠️ HIGH: Update {impact_breakdown['dependencies']['count']} vulnerable dependencies. "
                 "Run 'npm audit fix' to resolve automatically."
-            )
-        
-        if impact_breakdown["config_issues"]["count"] > 0:
-            recommendations.append(
-                f"📋 MEDIUM: Fix {impact_breakdown['config_issues']['count']} configuration issues. "
-                "Apply secure configuration defaults."
             )
         
         # Score-based recommendations
@@ -336,17 +292,10 @@ class EnhancedSecurityScorer:
                 "impact": f"+{data['deduction']:.1f} points",
                 "difficulty": "Medium",
                 "time": "10 minutes",
-                "auto_fixable": True
-            },
-            "config_issues": {
-                "title": "Apply secure configuration",
-                "impact": f"+{data['deduction']:.1f} points",
-                "difficulty": "Easy",
-                "time": "3 minutes",
-                "auto_fixable": True
+                "auto_fixable": False
             }
         }
-        
+
         return fix_map.get(category, {
             "title": "Fix security issues",
             "impact": f"+{data['deduction']:.1f} points",
@@ -363,7 +312,7 @@ class EnhancedSecurityScorer:
         total_fixes = sum(data["count"] for data in impact_breakdown.values())
         
         if total_fixes == 0:
-            return "Already A+ grade!"
+            return "Already there"
         elif total_fixes <= 3:
             return "10-15 minutes"
         elif total_fixes <= 7:

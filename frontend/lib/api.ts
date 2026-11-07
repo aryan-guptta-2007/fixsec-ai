@@ -1,190 +1,239 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+import { clearToken, getToken } from "./auth";
 
-export interface ApiResponse<T = any> {
-  data?: T
-  error?: string
-  message?: string
-}
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-class ApiClient {
-  private baseURL: string
-  private token: string | null = null
+export type UpgradeDetail = {
+  message: string;
+  current_plan: string;
+  feature: string;
+  upgrade_required: boolean;
+};
 
-  constructor(baseURL: string) {
-    this.baseURL = baseURL
-    
-    // Get token from localStorage if available
-    if (typeof window !== 'undefined') {
-      this.token = localStorage.getItem('auth_token')
-    }
-  }
+export class ApiError extends Error {
+  status: number;
+  upgrade?: UpgradeDetail;
 
-  setToken(token: string) {
-    this.token = token
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('auth_token', token)
-    }
-  }
-
-  clearToken() {
-    this.token = null
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('auth_token')
-    }
-  }
-
-  private async request<T>(
-    endpoint: string,
-    options: RequestInit = {}
-  ): Promise<ApiResponse<T>> {
-    const url = `${this.baseURL}${endpoint}`
-    
-    const headers: HeadersInit = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    }
-
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`
-    }
-
-    try {
-      const response = await fetch(url, {
-        ...options,
-        headers,
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        return {
-          error: errorData.detail || `HTTP ${response.status}: ${response.statusText}`
-        }
-      }
-
-      const data = await response.json()
-      return { data }
-    } catch (error) {
-      return {
-        error: error instanceof Error ? error.message : 'Network error'
-      }
-    }
-  }
-
-  // Auth endpoints
-  async getCurrentUser() {
-    return this.request('/auth/me')
-  }
-
-  // Repository endpoints
-  async getRepositories() {
-    return this.request('/repos/')
-  }
-
-  async getConnectedRepositories() {
-    return this.request('/repos/connected')
-  }
-
-  async connectRepository(repoId: number) {
-    return this.request(`/repos/${repoId}/connect`, {
-      method: 'POST'
-    })
-  }
-
-  // Scan endpoints
-  async startScan(repoId: number) {
-    return this.request(`/scan/start/${repoId}`, {
-      method: 'POST'
-    })
-  }
-
-  async getScanResults(scanId: number) {
-    return this.request(`/scan/${scanId}`)
-  }
-
-  async getVulnerabilityFix(vulnId: number) {
-    return this.request(`/scan/vulnerability/${vulnId}/fix`)
-  }
-
-  // PR endpoints
-  async createFixPR(scanId: number) {
-    return this.request(`/pr/create/${scanId}`, {
-      method: 'POST'
-    })
-  }
-
-  async getPRHistory() {
-    return this.request('/pr/history')
+  constructor(status: number, detail: unknown) {
+    const upgrade =
+      status === 402 && detail && typeof detail === "object" ? (detail as UpgradeDetail) : undefined;
+    super(upgrade?.message || (typeof detail === "string" ? detail : `Request failed (${status})`));
+    this.status = status;
+    this.upgrade = upgrade;
   }
 }
 
-export const api = new ApiClient(API_BASE_URL)
-
-// Types
-export interface Repository {
-  id: number
-  name: string
-  full_name: string
-  private: boolean
-  language: string
-  default_branch: string
-  updated_at: string
-  clone_url: string
-  html_url: string
-}
-
-export interface ConnectedRepository {
-  id: number
-  name: string
-  url: string
-  default_branch: string
-  is_private: boolean
-  created_at: string
-}
-
-export interface Vulnerability {
-  id: number
-  type: string
-  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
-  file_path: string
-  line_number?: number
-  message: string
-  fixable: boolean
-  confidence_score: number
-  created_at: string
-}
-
-export interface Scan {
-  id: number
-  status: 'pending' | 'running' | 'completed' | 'failed'
-  started_at: string
-  finished_at?: string
-  issues_found: number
-}
-
-export interface ScanResults {
-  scan: Scan
-  repository: {
-    id: number
-    name: string
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = getToken();
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+  } catch {
+    throw new ApiError(0, "Could not reach the server. Check your connection and try again.");
   }
-  vulnerabilities: Vulnerability[]
-  summary: {
-    total_issues: number
-    critical: number
-    high: number
-    medium: number
-    low: number
-    fixable: number
+
+  if (response.status === 401) {
+    clearToken();
+    window.location.href = "/login?error=session_expired";
+    throw new ApiError(401, "Your session has expired.");
   }
+
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new ApiError(response.status, body?.detail);
+  return body as T;
 }
 
-export interface PullRequest {
-  id: number
-  pr_url: string
-  branch_name: string
-  status: string
-  fixes_applied: number
-  created_at: string
-  repository: string
-  scan_id: number
-}
+const post = <T>(path: string, data?: unknown) =>
+  request<T>(path, { method: "POST", body: data === undefined ? undefined : JSON.stringify(data) });
+
+export const api = {
+  me: () => request<{ name: string; email: string | null; plan: string }>("/auth/me"),
+  repos: () => request<Repo[]>("/repos"),
+
+  scan: (fullName: string) => post<ScanResult>("/scan/", { full_name: fullName }),
+  getScan: (scanId: string | number) => request<ScanResult>(`/scan/${scanId}`),
+  overview: () => request<{ repos: RepoOverview[] }>("/history/overview"),
+
+  fixPlan: (repo: string) =>
+    post<{ fix_plan: FixPlan; can_auto_fix: boolean }>("/pr/fix-plan", { full_name: repo }),
+  autoFix: (repo: string) => post<PRResult>("/pr/auto-fix", { full_name: repo }),
+
+  plans: () => request<{ plans: Record<string, Plan> }>("/billing/plans"),
+  subscription: () => request<{ subscription: Subscription; plan: Plan }>("/billing/subscription"),
+  usage: () => request<{ usage: Usage }>("/billing/usage"),
+  subscribe: (planId: string) =>
+    post<{ checkout_url: string }>("/billing/subscribe", { plan_id: planId }),
+  cancelSubscription: () => post<{ message: string }>("/billing/cancel"),
+  billingPortal: () => request<{ portal_url: string }>("/billing/portal"),
+
+  schedules: () => request<{ schedules: Schedule[] }>("/schedule/list"),
+  createSchedule: (data: {
+    repo: string;
+    frequency: Frequency;
+    notification_channels: NotificationChannel[];
+  }) => post<{ schedule: Schedule }>("/schedule/create", data),
+  updateSchedule: (id: number, data: { enabled: boolean }) =>
+    request<{ schedule: Schedule }>(`/schedule/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+  deleteSchedule: (id: number) => request(`/schedule/${id}`, { method: "DELETE" }),
+};
+
+export type Repo = {
+  id: number;
+  name: string;
+  full_name: string;
+  private: boolean;
+  language: string | null;
+};
+
+export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
+
+export type Finding = {
+  id: string;
+  category: "secret" | "dependency" | "sql_injection";
+  type: string;
+  severity: Severity;
+  file_path: string;
+  line_number: number | null;
+  message: string;
+  fixable: boolean;
+  package?: string;
+  suggested_fix?: string;
+};
+
+export type SecurityScoreData = {
+  score: number;
+  grade: string;
+  risk_level: string;
+  time_to_a_plus: string;
+  severity_breakdown: Record<string, number>;
+  impact_breakdown: Record<string, { deduction: number; count: number; impact: string }>;
+  recommendations: string[];
+  next_best_fixes: {
+    title: string;
+    impact: string;
+    difficulty: string;
+    time: string;
+    auto_fixable: boolean;
+  }[];
+};
+
+export type ScanResult = {
+  scan_id: number;
+  repo: string;
+  status: string;
+  branch_scanned: string;
+  timestamp: string;
+  vulnerabilities: Finding[];
+  count: number;
+  security_score: SecurityScoreData;
+  noise_reduction: { original_count: number; filtered_count: number; noise_removed: number };
+  warnings: string[];
+};
+
+export type ScanRecord = {
+  scan_id: number;
+  timestamp: string;
+  count: number;
+  status: string;
+  score: number | null;
+  grade: string | null;
+  trigger: string;
+};
+
+export type RepoOverview = {
+  repo: string;
+  history: ScanRecord[];
+  score: {
+    current_score: SecurityScoreData | null;
+    trend_analysis: { trend: string; message: string };
+  } | null;
+};
+
+export type FixItem = {
+  vulnerability: Finding;
+  fix_method: string;
+  confidence: number;
+  risk_level: string;
+  explanation: string;
+  preview: string;
+  diff: { before: string; after: string } | null;
+};
+
+export type ReviewItem = {
+  vulnerability: Finding;
+  reason: string;
+  suggested_action: string;
+};
+
+export type FixPlan = {
+  fixable_automatically: FixItem[];
+  requires_review: ReviewItem[];
+  total_fixes: number;
+  estimated_time: string;
+  risk_assessment: string;
+};
+
+export type PRResult = {
+  status: string;
+  repo: string;
+  url?: string | null;
+  message?: string;
+  fixes_applied?: number;
+  fixes_failed?: number;
+  requires_review?: number;
+  env_vars?: string[];
+};
+
+export type Plan = {
+  name: string;
+  price: number;
+  repos_limit: number | null;
+  scans_per_day: number | null;
+  auto_fix: boolean;
+  scheduled_scans: boolean;
+  slack_alerts: boolean;
+};
+
+export type Subscription = {
+  plan_id: string;
+  status: string;
+  cancel_at_period_end: boolean;
+  current_period_end: string | null;
+};
+
+type Metered = { current: number; limit: number | null; unlimited: boolean };
+
+export type Usage = {
+  repositories: Metered;
+  scans_today: Metered;
+  scans_this_month: number;
+};
+
+export type Frequency = "daily" | "weekly" | "monthly";
+
+export type NotificationChannel = {
+  type: "email" | "discord" | "slack" | "webhook";
+  email?: string;
+  webhook_url?: string;
+};
+
+export type Schedule = {
+  schedule_id: number;
+  repo: string;
+  frequency: Frequency;
+  notification_channels: NotificationChannel[];
+  enabled: boolean;
+  status: string;
+  next_run: string;
+  last_run: string | null;
+  run_count: number;
+  last_result: { status: string; message?: string } | null;
+};

@@ -1,15 +1,30 @@
-from fastapi import APIRouter, Header, HTTPException, BackgroundTasks
+import json
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from sqlalchemy.orm import Session
+
+from core import github
+from core.billing import get_billing_manager
+from core.notifications import send_notifications, validate_webhook_url
+from core.scan_engine import PlanLimitError, is_demo_repo, require_github_token
 from core.scheduler import (
-    create_scheduled_scan, get_user_scheduled_scans, get_scheduled_scan,
-    update_scheduled_scan, delete_scheduled_scan, ScanFrequency,
-    NotificationChannel, mark_scan_completed, get_schedule_statistics
+    NotificationChannel,
+    ScanFrequency,
+    create_scheduled_scan,
+    get_scheduled_scan,
+    get_user_scheduled_scans,
+    next_run_after,
+    serialize_schedule,
 )
-from core.notifications import send_notifications
-import asyncio
+from db.models import ScheduledScan, User
+from db.session import get_db
+from routes.auth import get_current_user
 
 router = APIRouter()
+
 
 class NotificationChannelModel(BaseModel):
     type: NotificationChannel
@@ -17,201 +32,148 @@ class NotificationChannelModel(BaseModel):
     webhook_url: Optional[str] = None
     custom_payload: Optional[Dict[str, Any]] = None
 
+
 class CreateScheduleModel(BaseModel):
     repo: str
     frequency: ScanFrequency
-    notification_channels: List[NotificationChannelModel]
+    notification_channels: List[NotificationChannelModel] = []
     enabled: bool = True
+
 
 class UpdateScheduleModel(BaseModel):
     frequency: Optional[ScanFrequency] = None
     notification_channels: Optional[List[NotificationChannelModel]] = None
     enabled: Optional[bool] = None
 
+
+def _require_scheduling(db: Session, user: User) -> None:
+    billing = get_billing_manager(db)
+    if not billing.can_use_scheduled_scans(user.id):
+        plan = billing.get_user_plan(user.id)
+        raise PlanLimitError(
+            {
+                "error": "Scheduled scans not available",
+                "message": "Scheduled scans are on the Team plan. "
+                f"You're on the {plan['name']} plan.",
+                "upgrade_required": True,
+                "current_plan": plan["name"],
+                "feature": "scheduled_scans",
+            }
+        )
+
+
+def _validated_channels(channels: List[NotificationChannelModel]) -> List[Dict[str, Any]]:
+    validated = []
+    for channel in channels:
+        data = channel.model_dump(mode="json", exclude_none=True)
+        try:
+            if channel.type == NotificationChannel.EMAIL:
+                if not channel.email or "@" not in channel.email:
+                    raise ValueError("Enter a valid email address.")
+            else:
+                validate_webhook_url(channel.webhook_url, channel.type.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        validated.append(data)
+    return validated
+
+
+def _owned_schedule(db: Session, user: User, schedule_id: int) -> ScheduledScan:
+    schedule = get_scheduled_scan(db, user, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Scheduled scan not found")
+    return schedule
+
+
 @router.post("/create")
 def create_schedule(
     schedule_data: CreateScheduleModel,
-    authorization: str = Header(None)
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Create a new scheduled scan"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    token = authorization.replace("Bearer ", "").strip()
-    
-    # Convert Pydantic models to dicts
-    channels = [channel.dict(exclude_none=True) for channel in schedule_data.notification_channels]
-    
-    try:
-        schedule = create_scheduled_scan(
-            user_token=token,
-            repo=schedule_data.repo,
-            frequency=schedule_data.frequency,
-            notification_channels=channels,
-            enabled=schedule_data.enabled
-        )
-        
-        return {
-            "status": "Scheduled scan created ✅",
-            "schedule": schedule
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create schedule: {str(e)}")
+    _require_scheduling(db, user)
+    channels = _validated_channels(schedule_data.notification_channels)
+    if is_demo_repo(schedule_data.repo):
+        full_name = schedule_data.repo
+    else:
+        repo_info = github.get_repo(schedule_data.repo, require_github_token(user))
+        full_name = repo_info.get("full_name", schedule_data.repo)
+    schedule = create_scheduled_scan(
+        db,
+        user,
+        full_name,
+        schedule_data.frequency,
+        channels,
+        schedule_data.enabled,
+    )
+    return {"status": "Scheduled scan created", "schedule": serialize_schedule(schedule)}
+
 
 @router.get("/list")
-def list_schedules(authorization: str = Header(None)):
-    """Get all scheduled scans for the authenticated user"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    token = authorization.replace("Bearer ", "").strip()
-    
-    schedules = get_user_scheduled_scans(token)
-    
-    return {
-        "total": len(schedules),
-        "schedules": schedules
-    }
+def list_schedules(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    schedules = [serialize_schedule(item) for item in get_user_scheduled_scans(db, user)]
+    return {"total": len(schedules), "schedules": schedules}
 
-@router.get("/{schedule_id}")
-def get_schedule(
-    schedule_id: str,
-    authorization: str = Header(None)
-):
-    """Get a specific scheduled scan"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    token = authorization.replace("Bearer ", "").strip()
-    
-    schedule = get_scheduled_scan(schedule_id)
-    
-    if not schedule:
-        raise HTTPException(status_code=404, detail="Scheduled scan not found")
-    
-    # Verify ownership
-    if schedule["user_token"] != token:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    return schedule
-
-@router.put("/{schedule_id}")
-def update_schedule(
-    schedule_id: str,
-    update_data: UpdateScheduleModel,
-    authorization: str = Header(None)
-):
-    """Update a scheduled scan"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    token = authorization.replace("Bearer ", "").strip()
-    
-    # Verify ownership
-    schedule = get_scheduled_scan(schedule_id)
-    if not schedule:
-        raise HTTPException(status_code=404, detail="Scheduled scan not found")
-    
-    if schedule["user_token"] != token:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    try:
-        # Convert notification channels if provided
-        channels = None
-        if update_data.notification_channels:
-            channels = [channel.dict(exclude_none=True) for channel in update_data.notification_channels]
-        
-        updated_schedule = update_scheduled_scan(
-            schedule_id=schedule_id,
-            frequency=update_data.frequency,
-            notification_channels=channels,
-            enabled=update_data.enabled
-        )
-        
-        return {
-            "status": "Schedule updated ✅",
-            "schedule": updated_schedule
-        }
-    
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update schedule: {str(e)}")
-
-@router.delete("/{schedule_id}")
-def delete_schedule(
-    schedule_id: str,
-    authorization: str = Header(None)
-):
-    """Delete a scheduled scan"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    token = authorization.replace("Bearer ", "").strip()
-    
-    # Verify ownership
-    schedule = get_scheduled_scan(schedule_id)
-    if not schedule:
-        raise HTTPException(status_code=404, detail="Scheduled scan not found")
-    
-    if schedule["user_token"] != token:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    success = delete_scheduled_scan(schedule_id)
-    
-    if success:
-        return {"status": "Schedule deleted ✅"}
-    else:
-        raise HTTPException(status_code=404, detail="Scheduled scan not found")
 
 @router.post("/test-notification")
-async def test_notification(
-    notification_data: Dict[str, Any],
-    authorization: str = Header(None)
+def test_notification(
+    channel: NotificationChannelModel,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Test a notification channel"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    # Create a test scan result
-    test_scan_result = {
+    _require_scheduling(db, user)
+    channels = _validated_channels([channel])
+    sample = {
         "count": 3,
         "security_score": {
             "score": 75,
             "grade": "B",
-            "risk_level": "LOW",
-            "severity_breakdown": {
-                "HIGH": 1,
-                "MEDIUM": 2
-            }
-        }
+            "risk_level": "MEDIUM",
+            "severity_breakdown": {"HIGH": 1, "MEDIUM": 2},
+        },
     }
-    
-    try:
-        results = await send_notifications(
-            notification_channels=[notification_data],
-            scan_result=test_scan_result,
-            repo="test/repository"
-        )
-        
-        return {
-            "status": "Test notification sent ✅",
-            "results": results
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Test notification failed: {str(e)}")
+    return {"results": send_notifications(channels, sample, "test/repository")}
 
-@router.get("/stats/overview")
-def get_scheduling_stats(authorization: str = Header(None)):
-    """Get scheduling statistics"""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    
-    stats = get_schedule_statistics()
-    
-    return {
-        "status": "Statistics retrieved ✅",
-        "statistics": stats
-    }
+
+@router.get("/{schedule_id}")
+def get_schedule(
+    schedule_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return serialize_schedule(_owned_schedule(db, user, schedule_id))
+
+
+@router.put("/{schedule_id}")
+def update_schedule(
+    schedule_id: int,
+    update_data: UpdateScheduleModel,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    schedule = _owned_schedule(db, user, schedule_id)
+    if update_data.enabled:
+        _require_scheduling(db, user)
+
+    if update_data.frequency is not None:
+        schedule.frequency = update_data.frequency.value
+        schedule.next_run = next_run_after(datetime.utcnow(), schedule.frequency)
+    if update_data.notification_channels is not None:
+        schedule.notification_channels = json.dumps(
+            _validated_channels(update_data.notification_channels)
+        )
+    if update_data.enabled is not None:
+        schedule.enabled = update_data.enabled
+    db.commit()
+    return {"status": "Schedule updated", "schedule": serialize_schedule(schedule)}
+
+
+@router.delete("/{schedule_id}")
+def delete_schedule(
+    schedule_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    db.delete(_owned_schedule(db, user, schedule_id))
+    db.commit()
+    return {"status": "Schedule deleted"}

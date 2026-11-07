@@ -16,11 +16,11 @@ export default function BillingCancelPage() {
           </div>
           
           <h1 className="text-2xl font-bold text-gray-900 mb-2">
-            Subscription Canceled
+            Checkout Canceled
           </h1>
           
           <p className="text-gray-600 mb-6">
-            No worries! You can always upgrade later when you're ready to unlock the full power of FixSec AI.
+            You haven&apos;t been charged. You can upgrade any time from the billing page.
           </p>
           
           <div className="space-y-3">

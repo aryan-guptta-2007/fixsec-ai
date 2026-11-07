@@ -6,9 +6,16 @@ import os
 import sys
 from pathlib import Path
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 from alembic.config import Config
 from alembic import command
 import logging
+
+# Emoji log lines must not crash on Windows code pages
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # Add the parent directory to the path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -20,42 +27,38 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def create_database_if_not_exists():
-    """Create database if it doesn't exist (PostgreSQL only)"""
+    """Create the database when it is missing (PostgreSQL only, best effort).
+
+    Hosted databases already exist and usually forbid access to the maintenance
+    database, so failing here must not stop the deployment.
+    """
     if not DATABASE_URL.startswith("postgresql"):
         logger.info("Using SQLite - database will be created automatically")
         return
-    
-    # Extract database name from URL
-    # postgresql://user:pass@host:port/dbname
+
     try:
-        db_name = DATABASE_URL.split("/")[-1]
-        base_url = "/".join(DATABASE_URL.split("/")[:-1])
-        
-        # Connect to postgres database to create our database
-        postgres_url = f"{base_url}/postgres"
-        temp_engine = create_engine(postgres_url)
-        
+        with engine.connect():
+            logger.info("Database already exists")
+            return
+    except OperationalError as e:
+        logger.info(f"Could not connect to target database, trying to create it: {type(e).__name__}")
+
+    url = make_url(DATABASE_URL)
+    temp_engine = create_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    try:
         with temp_engine.connect() as conn:
-            # Check if database exists
-            result = conn.execute(
+            exists = conn.execute(
                 text("SELECT 1 FROM pg_database WHERE datname = :db_name"),
-                {"db_name": db_name}
-            )
-            
-            if not result.fetchone():
-                logger.info(f"Creating database: {db_name}")
-                # Create database (must be outside transaction)
-                conn.execute(text("COMMIT"))
-                conn.execute(text(f"CREATE DATABASE {db_name}"))
-                logger.info(f"Database {db_name} created successfully")
-            else:
-                logger.info(f"Database {db_name} already exists")
-        
-        temp_engine.dispose()
-        
+                {"db_name": url.database},
+            ).fetchone()
+            if not exists:
+                quoted = temp_engine.dialect.identifier_preparer.quote(url.database)
+                conn.execute(text(f"CREATE DATABASE {quoted}"))
+                logger.info(f"Database {url.database} created successfully")
     except Exception as e:
-        logger.error(f"Error creating database: {e}")
-        raise
+        logger.warning(f"Could not create database automatically: {type(e).__name__}")
+    finally:
+        temp_engine.dispose()
 
 def run_migrations():
     """Run Alembic migrations to create/update schema"""
@@ -99,7 +102,10 @@ def verify_database():
             result = conn.execute(text(tables_query))
             tables = [row[0] for row in result.fetchall()]
             
-            expected_tables = ["users", "repositories", "scans", "vulnerabilities", "pull_requests"]
+            expected_tables = [
+                "users", "repositories", "scans", "vulnerabilities",
+                "pull_requests", "subscriptions", "scheduled_scans",
+            ]
             missing_tables = [table for table in expected_tables if table not in tables]
             
             if missing_tables:
@@ -114,7 +120,7 @@ def verify_database():
 def init_database():
     """Initialize database for production deployment"""
     logger.info("Initializing FixSec AI database...")
-    logger.info(f"Database URL: {DATABASE_URL.split('@')[0]}@***")  # Hide credentials
+    logger.info(f"Database: {make_url(DATABASE_URL).render_as_string(hide_password=True)}")
     
     try:
         # Step 1: Create database if needed

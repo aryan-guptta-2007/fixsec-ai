@@ -1,42 +1,87 @@
-from dotenv import load_dotenv
-load_dotenv()
+import sys
 
-from fastapi import FastAPI
+# Windows consoles and pipes default to a legacy code page that cannot encode
+# the emoji used in log output, which would otherwise crash whatever printed it.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from routes import auth, repos, scan, pr, history, schedule, workspace, billing
-from config import settings
+from fastapi.responses import JSONResponse
 
-# Initialize Sentry for error tracking in production (optional)
-try:
-    import sentry_sdk
-    from sentry_sdk.integrations.fastapi import FastApiIntegration
-    
-    if settings.SENTRY_DSN:
+from config import settings
+from core.billing import BillingManager  # noqa: F401  (validates plan config at import)
+from core.github import GitHubError
+from core.scan_engine import PlanLimitError
+from core.scheduler import SchedulerThread
+from core.workspace import WorkspaceError
+from routes import auth, billing, history, pr, repos, scan, schedule, workspace
+
+logging.basicConfig(level=logging.DEBUG if settings.DEBUG else logging.INFO)
+logger = logging.getLogger(__name__)
+
+settings.validate()
+
+if settings.SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        # The FastAPI integration turns itself on when the package is present.
         sentry_sdk.init(
             dsn=settings.SENTRY_DSN,
-            integrations=[FastApiIntegration(auto_enabling=True)],
             traces_sample_rate=0.1,
             environment=settings.ENVIRONMENT,
         )
-        print("✅ Sentry initialized for error tracking")
-except ImportError:
-    print("⚠️ Sentry not available - continuing without error tracking")
+    except ImportError:
+        logger.warning("SENTRY_DSN is set but sentry-sdk is not installed")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    scheduler = SchedulerThread()
+    if settings.SCHEDULER_ENABLED:
+        scheduler.start()
+    yield
+    if settings.SCHEDULER_ENABLED:
+        scheduler.stop()
+
 
 app = FastAPI(
-    title="FixSec AI - Enterprise Security Scanner",
+    title="FixSec AI - Security Scanner",
     description="Automated security vulnerability scanning and remediation platform",
     version="1.0.0",
-    docs_url="/docs" if not settings.is_production else None,  # Disable docs in production
-    redoc_url="/redoc" if not settings.is_production else None,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.exception_handler(GitHubError)
+def handle_github_error(_request: Request, exc: GitHubError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+@app.exception_handler(WorkspaceError)
+def handle_workspace_error(_request: Request, exc: WorkspaceError):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(PlanLimitError)
+def handle_plan_limit(_request: Request, exc: PlanLimitError):
+    return JSONResponse(status_code=402, content={"detail": exc.detail})
+
 
 app.include_router(auth.router, prefix="/auth")
 app.include_router(repos.router, prefix="/repos")
@@ -47,19 +92,12 @@ app.include_router(schedule.router, prefix="/schedule")
 app.include_router(workspace.router, prefix="/workspace")
 app.include_router(billing.router, prefix="/billing")
 
+
 @app.get("/")
 def root():
-    return {
-        "message": "FixSec AI - Enterprise Security Scanner",
-        "version": "1.0.0",
-        "environment": settings.ENVIRONMENT,
-        "status": "operational"
-    }
+    return {"message": "FixSec AI", "version": "1.0.0", "status": "operational"}
+
 
 @app.get("/health")
 def health_check():
-    return {
-        "status": "healthy",
-        "environment": settings.ENVIRONMENT,
-        "version": "1.0.0"
-    }
+    return {"status": "healthy", "version": "1.0.0"}

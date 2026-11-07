@@ -1,11 +1,11 @@
 [phases.setup]
-nixPkgs = ["python39", "nodejs", "git"]
+nixPkgs = ["python311", "nodejs_22", "git"]
 
 [phases.install]
-cmds = ["cd backend && pip install -r requirements-prod.txt"]
+cmds = ["cd backend && python -m venv /opt/venv && . /opt/venv/bin/activate && pip install -r requirements-prod.txt"]
 
 [phases.build]
-cmds = ["cd backend && python -m compileall ."]
+cmds = ["cd backend && . /opt/venv/bin/activate && python -m compileall -q ."]
 
 [start]
-cmd = "cd backend && python db/init_db.py && uvicorn main:app --host 0.0.0.0 --port $PORT"
+cmd = "cd backend && . /opt/venv/bin/activate && python db/init_db.py && gunicorn main:app -k uvicorn.workers.UvicornWorker -w 2 --timeout 300 -b 0.0.0.0:$PORT"

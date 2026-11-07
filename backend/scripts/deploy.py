@@ -9,6 +9,11 @@ import subprocess
 import logging
 from pathlib import Path
 
+# Emoji log lines must not crash on Windows code pages
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # Add the parent directory to the path
 sys.path.append(str(Path(__file__).parent.parent))
 
